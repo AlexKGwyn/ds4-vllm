@@ -1762,10 +1762,33 @@
          gate = torch.clamp(x[..., :d], max=self.swiglu_limit)
 --- a/opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/cuda_communicator.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/cuda_communicator.py
-@@ -252,6 +252,57 @@
+@@ -252,6 +252,80 @@
          )
  
      def all_reduce(self, input_):
++        # DS4_ODL_AR2=1: tbv_ar2-equivalent all-reduce over the OdinLink
++        # stream API (libodl_ar2 / odl_tb5). Same 2-rank gating and
++        # eligibility as DS4_TBV_AR2 below; decode-sized ops take this path,
++        # prefill falls through to RCCL (over the OdinLink net plugin).
++        import os as _os3
++        if _os3.environ.get("DS4_ODL_AR2") == "1" and not getattr(self, "_odl2_failed", False):
++            _q3 = getattr(self, "_odl_ar2", None)
++            if _q3 is None:
++                try:
++                    import torch.distributed as _d3
++                    if _d3.get_world_size(group=self.device_group) == 2:
++                        from odl_ar2 import OdlAllReduce2
++                        self._odl_ar2 = _q3 = OdlAllReduce2(
++                            _d3.get_rank(group=self.device_group))
++                    else:
++                        self._odl2_failed = True
++                except Exception as _e3:
++                    import logging
++                    logging.getLogger(__name__).warning("odl_ar2 init failed: %s", _e3)
++                    self._odl2_failed = True
++            if _q3 is not None and _q3.eligible(input_):
++                _r3 = torch.empty_like(input_)
++                return _q3.all_reduce_out(input_, _r3)
 +        # DS4_TBV_AR2=1: v2 GPU-poll + progress-thread RDMA all-reduce, fully
 +        # stream-async. Takes precedence over v1. Same eligibility/2-rank gating;
 +        # falls through to the normal chain when ineligible. Carries the decode

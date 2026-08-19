@@ -4,11 +4,12 @@
 # TheRock/ROCm gfx1151 base image — the exact base the patches were developed
 # against. The base already contains the full ROCm 7 + PyTorch + vLLM build
 # (vLLM commit 470229c); this file applies the DeepSeek-V4 / DSpark patch
-# (patches/vllm-upstream.patch, 35 files), overlays the 16 new files from
+# (patches/vllm-upstream.patch, 35 files), overlays the 17 new files from
 # ./rootfs, builds the usb4_rdma provider from source (rdma-core + the
 # upstream thunderbolt-ibverbs patches), compiles the TB4-RDMA all-reduce
-# natives, and rebuilds ROCr. Third-party sources are FETCHED at pinned
-# commits, not vendored (network needed on first build).
+# natives, builds the OdinLink userspace (net plugin + odl_ar2, used only by
+# `transport: odl`), and rebuilds ROCr. Third-party sources are FETCHED at
+# pinned commits, not vendored (network needed on first build).
 #
 # Build (context is the REPO ROOT):
 #   container/build.sh               # -> ds4-vllm-patched:local
@@ -67,6 +68,37 @@ RUN git clone --depth 1 -b v57.0 https://github.com/linux-rdma/rdma-core /tmp/rd
     cmake --build build --parallel 16 && \
     ls build/lib/libusb4_rdma-rdmav57.so
 
+# Build the OdinLink userspace for the alternative `transport: odl` fabric:
+# libodl_tb5 (the stream API over /dev/odl_tb5_*), the RCCL net plugin RCCL
+# dlopens via NCCL_NET_PLUGIN, and the odl_ar2 decode all-reduce that
+# rootfs' odl_ar2.py ctypes-loads under DS4_ODL_AR2=1. Fetched at the same
+# pin as odinlink/build-odinlink.sh, with the same local patch. The kernel
+# driver (odl_tb5.ko) is a per-kernel HOST build — see odinlink/README.md.
+# Inert under the default rdma transport: nothing outside the odl env
+# profile references these files.
+FROM ${DS4_BASE} AS odinlink-build
+USER root
+RUN dnf install -y git cmake gcc && dnf clean all
+COPY odinlink/odinlink-local.patch odinlink/ar2/odl_ar2.hip /tmp/
+RUN git clone https://github.com/Geramy/OdinLink-Five /tmp/odinlink && \
+    git -C /tmp/odinlink checkout 4534f5852253503e61f8540a175d7e32cb072c3b && \
+    git -C /tmp/odinlink apply /tmp/odinlink-local.patch && \
+    cd /tmp/odinlink && \
+    cmake -S . -B build \
+      -DBUILD_KERNEL_MODULE=OFF -DBUILD_DAEMON=OFF -DBUILD_TRAY=OFF \
+      -DBUILD_NCCL=OFF -DBUILD_VERBS=OFF && \
+    cmake --build build --target odl_tb5 --parallel 16 && \
+    /opt/rocm/llvm/bin/clang -O3 -DNDEBUG -fPIC \
+      -I third_party/rccl -I lib/include \
+      -shared -Wl,-soname,librccl_net_odl_tb5.so \
+      -Wl,-rpath,/usr/local/lib/odinlink \
+      -o build/librccl_net_odl_tb5.so rccl/src/odl_tb5_plugin.c \
+      build/lib/libodl_tb5.so.0.1.0 && \
+    /opt/rocm/bin/hipcc -O3 --offload-arch=gfx1151 -fPIC -shared \
+      -I lib/include -Wl,-rpath,/usr/local/lib/odinlink \
+      -o build/libodl_ar2.so /tmp/odl_ar2.hip \
+      -L build/lib -lodl_tb5
+
 FROM ${DS4_BASE}
 
 # Apply the vLLM patch-set to the base's own sources (35 files), then overlay
@@ -89,6 +121,19 @@ COPY --from=rocr-idle-fix --chown=root:root \
 COPY --from=provider-build --chown=root:root \
   /tmp/rdma-core/build/lib/libusb4_rdma-rdmav57.so /usr/lib64/libibverbs/
 RUN printf 'driver usb4_rdma\n' > /etc/libibverbs.d/usb4_rdma.driver
+
+# OdinLink userspace (`transport: odl` only). The odl env profile points
+# NCCL_NET_PLUGIN at the plugin and odl_ar2.py finds libodl_ar2.so next to
+# itself in site-packages; both resolve libodl_tb5.so.0 via their rpath.
+COPY --from=odinlink-build --chown=root:root \
+  /tmp/odinlink/build/lib/libodl_tb5.so.0.1.0 \
+  /tmp/odinlink/build/librccl_net_odl_tb5.so \
+  /usr/local/lib/odinlink/
+RUN ln -s libodl_tb5.so.0.1.0 /usr/local/lib/odinlink/libodl_tb5.so.0 && \
+    ln -s libodl_tb5.so.0 /usr/local/lib/odinlink/libodl_tb5.so
+COPY --from=odinlink-build --chown=root:root \
+  /tmp/odinlink/build/libodl_ar2.so \
+  /opt/venv/lib/python3.12/site-packages/libodl_ar2.so
 
 # Build the TB4-RDMA all-reduce natives that tbv_ar.py / tbv_ar2.py ctypes-load.
 # rootfs/ carries only the python wrappers, so without this step DS4_TBV_AR2
