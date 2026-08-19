@@ -1,0 +1,73 @@
+# ROCm stable therock-7.14 upgrade layer over the patched DS4 image.
+#
+# Swaps the venv's alpha nightly ROCm/torch/triton set (7.14.0a20260608 /
+# torch 2.13.0a0) for the stable therock-7.14 release wheels
+# (https://repo.amd.com/rocm/whl-multi-arch/, rocm 7.14.0,
+# torch 2.13.0+rocm7.14.0). The existing patched vLLM wheel
+# (0.22.1rc1.dev499+g470229c37 + DS4 patch-set) is KEPT and re-used against
+# the stable torch (same 2.13 line; ABI-reuse — verified by the import smoke
+# check below and the live cluster gates). torch's ROCm runtime comes from
+# the venv wheels via torch/_rocm_init.py -> rocm_sdk.initialize_process, so
+# swapping the wheels swaps the runtime; /opt/rocm (June-12 nightly tarball)
+# remains only as an auxiliary toolchain.
+#
+# NOTE: the base's custom-rebuilt ROCr (event-age series + DS4 indefinite-wait
+# policy, container/Dockerfile rocr-idle-fix stage) lived inside the
+# rocm-sdk-core wheel tree and is REPLACED by the stock stable ROCr here.
+#
+# Build (context = repo root):
+#   podman build -t ds4-vllm-rocm714:$(date +%Y%m%d) -f container/Dockerfile.rocm714 .
+
+ARG DS4_PREV="localhost/ds4-vllm-patched:20260815-clonecheck"
+FROM ${DS4_PREV}
+USER root
+
+# 1) Swap the alpha wheel set for the stable therock-7.14 release set.
+RUN /opt/venv/bin/pip uninstall -y \
+      rocm rocm-sdk-core rocm-sdk-libraries-gfx1151 \
+      torch torchaudio torchvision triton && \
+    /opt/venv/bin/pip install --no-cache-dir \
+      --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+      --extra-index-url https://pypi.org/simple/ \
+      "rocm[libraries,device-gfx1151]==7.14.0" \
+      "torch==2.13.0+rocm7.14.0" \
+      "amd-torch-device-gfx1151==2.13.0+rocm7.14.0" \
+      "torchvision==0.28.0+rocm7.14.0" \
+      "torchaudio==2.11.0.2+rocm7.14.0"
+# (triton unpinned: stable torch pins triton==3.8.0+git4cff872c.rocm7.14.0)
+
+# 1b) Re-apply the rootfs overlay: the 20260815 parent image predates
+#     odl_ar2.py landing in rootfs/ (it was live-patched into the old
+#     containers); this bakes the current overlay in. NOTE the DS4_ODL_AR2
+#     branch of cuda_communicator.py is still a live-only container patch,
+#     not in the repo -- re-apply it after any container recreate.
+COPY --chown=root:root container/rootfs/ /
+
+# 2) Recompile the TB4-RDMA all-reduce natives with the stable hipcc so the
+#    HIP runtime they link matches the wheels now in the venv.
+COPY --chown=root:root container/native/ /tmp/ds4-native/
+RUN dnf install -y rdma-core-devel && \
+    /opt/venv/bin/hipcc -O2 --offload-arch=gfx1151 -shared -fPIC \
+      -o /opt/venv/lib/python3.12/site-packages/libtbv_ar2.so \
+      /tmp/ds4-native/tbv_ar2.hip -libverbs -lpthread && \
+    gcc -O2 -shared -fPIC \
+      -o /opt/venv/lib/python3.12/site-packages/libtbv_ar.so \
+      /tmp/ds4-native/tbv_ar.c -libverbs && \
+    dnf clean all && rm -rf /tmp/ds4-native
+
+# 3) ABI-reuse smoke gate: torch must import and report the stable versions,
+#    and the existing vLLM wheel must import against the stable torch.
+#    (No GPU inside the build; CPU-side import only.)
+RUN /opt/venv/bin/python - <<'EOF'
+import torch
+print("torch", torch.__version__, "hip", torch.version.hip)
+assert torch.__version__.startswith("2.13.0+rocm7.14.0"), torch.__version__
+import vllm
+print("vllm", vllm.__version__)
+EOF
+
+LABEL ds4.rocm="7.14.0-stable-therock" \
+      ds4.torch="2.13.0+rocm7.14.0" \
+      ds4.vllm_commit="470229c" \
+      ds4.vllm_build="abi-reuse-of-alpha-wheel" \
+      ds4.prev_image="localhost/ds4-vllm-patched:20260815-clonecheck"
