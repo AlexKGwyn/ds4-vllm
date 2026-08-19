@@ -100,6 +100,10 @@ ds4-vllm-share/
 │   ├── nhi-throttle-mod/         ← NHI IRQ-throttle module source
 │   ├── build-scripts/, bringup/  ← per-kernel build recipes + coordinated bring-up
 │   ├── systemd/                  ← boot units (matched core+net; RoCE bring-up)
+├── odinlink/                     ← alternative transport: OdinLink Thunderbolt driver (transport: odl)
+│   ├── build-odinlink.sh         ← fetch pinned OdinLink-Five + build odl_tb5.ko (host)
+│   ├── install-odinlink.sh, odl-swap.sh, systemd/ ← install + MOK-sign + boot unit
+│   ├── odinlink-local.patch, ar2/ ← our diff on the pin; odl_ar2 decode all-reduce
 ├── host/                         ← host-side orchestration (run outside the container)
 │   ├── ds4-config.yaml, ds4-config ← site config (IPs, transport, disk KV) + loader
 │   ├── ds4-cluster-restart.sh    ← full validated bringup (ExecStart of ds4-vllm.service)
@@ -128,7 +132,10 @@ ds4-vllm-share/
   kernel-version-specific and must be rebuilt per kernel. **Secure Boot must be
   disabled** (or sign the modules with your own MOK) — they are unsigned and a
   Secure Boot kernel refuses to load them. Without RDMA, the stack still runs
-  on `transport: tcp` (much slower decode).
+  on `transport: tcp` (much slower decode). An alternative Thunderbolt
+  transport, OdinLink (`transport: odl`), is included in
+  [`odinlink/`](odinlink/) — its load path signs the driver with the host's
+  enrolled MOK when one is present, so it can run under Secure Boot.
 - **Model weights**: [`deepseek-ai/DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
   (~150 GB checkpoint). Not included — `hf download deepseek-ai/DeepSeek-V4-Flash-0731`
   on both boxes (the `model:` key in `ds4-config.yaml` takes an HF id or a local
@@ -144,12 +151,14 @@ cd container
 ```
 
 This does `FROM docker.io/kyuz0/vllm-therock-gfx1151@<pinned-digest>`, applies
-`container/patches/vllm-upstream.patch` to the base's own vLLM sources (31
-files), overlays the 12 new files from `container/rootfs/`
+`container/patches/vllm-upstream.patch` to the base's own vLLM sources (35
+files), overlays the 17 new files from `container/rootfs/`
 (see [`container/patches/MANIFEST.md`](container/patches/MANIFEST.md)), builds
 the `usb4_rdma` libibverbs provider from source (rdma-core `v57.0` + the
 upstream provider patches, both fetched at pinned revisions), compiles the
-TB4-RDMA all-reduce natives, and rebuilds ROCr with the idle-wait fix. The
+TB4-RDMA all-reduce natives, builds the OdinLink userspace (net plugin +
+`odl_ar2`; used only by `transport: odl`), and rebuilds ROCr with the
+idle-wait fix. The
 base is ~35 GB and is pulled on first build; network is needed on the first
 build for the pinned source fetches.
 
@@ -198,11 +207,14 @@ site) as `~/ds4-config.yaml` on box1 next to the scripts:
 
 ```yaml
 model: deepseek-ai/DeepSeek-V4-Flash-0731   # HF id or local path; weights on BOTH boxes
-transport: rdma        # rdma | tcp — which ds4-cluster-env.<transport>.sh the cluster sources
+transport: rdma        # rdma | tcp | odl — which ds4-cluster-env.<transport>.sh the cluster sources
 head_ip: 192.168.100.1
 worker_ip: 192.168.100.2
 container: vllm        # podman container name (same on both boxes)
 rdma_hca: usb4_rdma0   # NCCL_IB_HCA pin, rdma transport only
+control_iface_head: thunderbolt0   # NCCL/GLOO bootstrap-socket interface per box
+control_iface_worker: thunderbolt0
+odl_rank1_ip: 192.168.100.2        # odl transport only: odl_ar2 rendezvous address (usually = worker_ip)
 api_port: 1234
 disk_kv: true          # NVMe prefix-KV tier (fs_lru); prefixes survive restarts
 disk_kv_gib: 30        # per-NODE disk cap; check df on BOTH boxes before raising
@@ -215,13 +227,15 @@ cables: 1              # Thunderbolt cables between the boxes: 1 works; 2 adds t
 
 `host/ds4-config` (stdlib Python, no pyyaml) turns it into `DS4_*` exports for
 the scripts. `transport: tcp` runs the same cluster without RDMA (correctness /
-fallback profile; the tbv_ar decode all-reduce is disabled).
+fallback profile; the tbv_ar decode all-reduce is disabled). `transport: odl`
+runs it on the OdinLink driver instead of the tbv ibverbs stack — see
+**OdinLink transport** below.
 
 Deploy (paths are `$HOME`-relative, same layout on both boxes):
 
 - **box1**: `host/ds4-config{,.yaml}`, `ds4-cluster-restart.sh`,
   `ds4-cluster-down.sh`, `ds4-vllm-manual-serve.sh`, `ds4-vllm-warmup.py`,
-  `container-heal.sh`, all three `ds4-cluster-env*.sh`, and
+  `container-heal.sh`, all four `ds4-cluster-env*.sh`, and
   `host/systemd/ds4-vllm.service` into `~/.config/systemd/user/`.
 - **box2**: `ds4-cluster-env*.sh` and `container-heal.sh` only — box2 is driven
   over ssh (key auth box1→box2 required).
@@ -230,6 +244,35 @@ Then `systemctl --user start ds4-vllm` brings up the whole 2-box cluster
 (teardown → container heal → ray on both boxes → `vllm serve` → API/RDMA
 verify); `stop` tears it down. The env files must stay **identical on both
 boxes** — the two TP ranks silently diverge otherwise. 
+
+---
+
+## OdinLink transport (alternative)
+
+`transport: odl` carries the inter-box fabric on the
+[OdinLink](https://github.com/Geramy/OdinLink-Five) Thunderbolt driver
+(`odl_tb5`) instead of the tbv ibverbs stack: RCCL runs over the OdinLink net
+plugin and the decode all-reduce over `odl_ar2`, both built into the image —
+the kernel driver is the only host build. Requirements: the tbv base layer
+from §1 (the driver builds against the tbv-patched thunderbolt headers and
+runs on the patched core), and **exactly one** Thunderbolt cable between the
+boxes. `odinlink.service` and `tbv-roce.service` are mutually exclusive (the
+unit's `Conflicts=` enforces it) — a box runs one RDMA stack at a time.
+
+Bring-up, on **both** boxes:
+
+```bash
+odinlink/build-odinlink.sh            # driver + lib (after tbv/build-modules.sh)
+sudo odinlink/install-odinlink.sh     # stage /usr/local + enable odinlink.service
+sudo systemctl disable --now tbv-roce.service
+sudo systemctl start odinlink.service # or reboot; modules then load at boot
+```
+
+The load path signs `odl_tb5.ko` with the host's enrolled MOK when one is
+present, so unlike the tbv modules it can load under Secure Boot (see
+**Prerequisites**). Once `odl-state` reports `state=ready` on both boxes, set
+`transport: odl` in `~/ds4-config.yaml` and start the cluster normally.
+Details, constraints and the local patch inventory: [`odinlink/`](odinlink/).
 
 ---
 

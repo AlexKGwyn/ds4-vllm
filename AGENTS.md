@@ -42,7 +42,9 @@ Three independent layers, build/verify them in this order:
   on **both** boxes (`hf download deepseek-ai/DeepSeek-V4-Flash-0731`).
 - Root/sudo on both boxes (kernel modules, systemd units).
 - **Secure Boot disabled on both boxes** — the tbv modules are unsigned;
-  a Secure Boot kernel will refuse every `insmod` in §1.
+  a Secure Boot kernel will refuse every `insmod` in §1. (The optional
+  OdinLink transport in §1.6 signs its driver with the host's enrolled MOK
+  at load time, but the §1 tbv core it depends on still needs this.)
 
 Pick roles now and keep them consistent everywhere: **box1 = ray head**, IP on
 Thunderbolt `192.168.100.1`; **box2 = worker**, `192.168.100.2`. Site values
@@ -149,6 +151,34 @@ on both boxes.
 (much slower decode). If you want to validate the model path first, skip to
 §2–§4 on TCP now and return to finish RDMA once tokens are flowing.
 
+### 1.6 OPTIONAL — OdinLink transport (`transport: odl`)
+
+An alternative Thunderbolt fabric ([`odinlink/`](odinlink/README.md)):
+RCCL over the OdinLink net plugin + the `odl_ar2` decode all-reduce, in
+place of the tbv ibverbs stack. It still needs §1.1 done first (the driver
+builds against the tbv-patched thunderbolt headers and runs on the patched
+core loaded by `tbv-thunderbolt-patched.service`); it replaces only
+`thunderbolt_ibverbs`. Requires **exactly one** Thunderbolt cable
+(`cables: 1`). The userspace (plugin + `odl_ar2`) ships inside the §2 image
+— the kernel driver is the only host build. Ordered steps, on **both**
+boxes:
+
+```bash
+odinlink/build-odinlink.sh            # odl_tb5.ko + libodl_tb5 (no sudo)
+sudo odinlink/install-odinlink.sh     # stage /usr/local, enable odinlink.service
+sudo systemctl disable --now tbv-roce.service   # Conflicts= makes these exclusive
+sudo systemctl start odinlink.service # or reboot; start both boxes promptly together
+/usr/local/bin/odl-state              # gate: dev0 state=ready
+```
+
+The service's load path (`odl-swap.sh`) signs `odl_tb5.ko` with the host's
+enrolled MOK when present (`/var/lib/shim-signed/mok/`), so it loads under
+Secure Boot. Then set `transport: odl` in `~/ds4-config.yaml` (plus
+`odl_rank1_ip`/`control_iface_*` if they differ from the defaults) and
+continue with §2–§4 unchanged; the §4 verify line reports
+`odl_ar2: rank0 ready`. Switch back with `transport: rdma`, re-enabling
+`tbv-roce.service`, and a coordinated reboot.
+
 ---
 
 ## 2. Build the vLLM engine
@@ -159,7 +189,7 @@ See [`container/`](container/). On **each** box:
 cd container && ./build.sh                # -> ds4-vllm-patched:local  (base ~35 GB pulled once)
 ```
 This is `FROM kyuz0/vllm-therock-gfx1151@<pinned digest>` + the DS4 patch-set
-(31 modified files as `patches/vllm-upstream.patch`, 12 new — see
+(35 modified files as `patches/vllm-upstream.patch`, 17 new — see
 `container/patches/MANIFEST.md`). Then create the serving container, named per
 `container:` in `ds4-config.yaml` (default **`vllm`**):
 
@@ -176,7 +206,7 @@ distrobox enter vllm -- ibv_devices             # gate: lists usb4_rdma0 (if §1
 
 Deploy the `host/` files per README §3 and set the site values in
 `~/ds4-config.yaml` on box1 (head/worker IPs, container name, `transport:
-rdma|tcp`, RDMA HCA pin, disk KV). Two rules that bite:
+rdma|tcp|odl`, RDMA HCA pin, disk KV). Two rules that bite:
 
 - `ds4-cluster-env*.sh` **must be byte-identical on both boxes** — the two TP
   ranks silently diverge otherwise. Copy the same files to both.

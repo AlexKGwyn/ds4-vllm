@@ -3,11 +3,14 @@
 # read it via `eval "$("$HOME/ds4-config")"`. Flat key: value only -- parsed
 # by ds4-config with the Python stdlib, no pyyaml.
 model: deepseek-ai/DeepSeek-V4-Flash-0731   # HF id (auto-downloaded to the HF cache) or a local path; weights needed on BOTH boxes
-transport: rdma        # rdma | tcp -- which ds4-cluster-env.<transport>.sh the cluster sources
+transport: rdma        # rdma | tcp | odl -- which ds4-cluster-env.<transport>.sh the cluster sources (odl needs odinlink/ set up first)
 head_ip: 192.168.100.1
 worker_ip: 192.168.100.2
 container: vllm        # podman container name (same on both boxes)
 rdma_hca: usb4_rdma0   # NCCL_IB_HCA pin, rdma transport only (the tbv bring-up names the rail usb4_rdma0)
+control_iface_head: thunderbolt0    # NCCL/GLOO bootstrap-socket interface per box; may differ per host
+control_iface_worker: thunderbolt0
+odl_rank1_ip: 192.168.100.2         # odl transport only: rank-1 rendezvous address for odl_ar2 (usually = worker_ip)
 api_port: 1234
 disk_kv: true          # NVMe prefix-KV tier (fs_lru); prefixes survive restarts
 disk_kv_gib: 30        # per-NODE disk cap; check df on BOTH boxes before raising

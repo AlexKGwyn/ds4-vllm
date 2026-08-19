@@ -39,8 +39,14 @@ RAY_NUM_CPUS=${RAY_NUM_CPUS:-4}
 CENV=$HOME/ds4-cluster-env.$TRANSPORT.sh
 SERVE=$HOME/ds4-vllm-manual-serve.sh
 UNIT=ds4-vllm-manual
-# Exports that must reach the env files on BOTH boxes (sourced at ray start).
-ENVPASS="export DS4_RDMA_HCA=${DS4_RDMA_HCA:-};"
+# Exports that must reach Ray before its workers are spawned. Control-interface
+# names can differ between otherwise identical hosts, so keep one payload per
+# node while retaining common transport settings.
+CONTROL_IFACE_HEAD=${DS4_CONTROL_IFACE_HEAD:-thunderbolt0}
+CONTROL_IFACE_WORKER=${DS4_CONTROL_IFACE_WORKER:-thunderbolt0}
+ODL_RANK1_IP=${DS4_ODL_RANK1_IP:-$WORKER_IP}
+HEAD_ENVPASS="export DS4_RDMA_HCA=${DS4_RDMA_HCA:-}; export DS4_CONTROL_IFACE=$CONTROL_IFACE_HEAD; export DS4_ODL_RANK1_IP=$ODL_RANK1_IP;"
+WORKER_ENVPASS="export DS4_RDMA_HCA=${DS4_RDMA_HCA:-}; export DS4_CONTROL_IFACE=$CONTROL_IFACE_WORKER; export DS4_ODL_RANK1_IP=$ODL_RANK1_IP;"
 [ -f "$CENV" ] || { echo "!! $CENV missing (transport=$TRANSPORT)"; exit 1; }
 # Memory + disk-KV knobs: yaml -> the DS4_* the serve script reads.
 case "${DS4_DISK_KV:-true}" in true|1|on|yes) DISK_KV=1;; *) DISK_KV=0;; esac
@@ -91,11 +97,11 @@ echo "== ray =="
 # --include-dashboard is head-only; ray PANICs if it is passed to a worker.
 RAYFLAGS="--num-gpus=1 --num-cpus=$RAY_NUM_CPUS --temp-dir=$RAYTMP"
 HEADFLAGS="$RAYFLAGS --include-dashboard=false"
-if ! out=$(inbox "$ENVPASS source $CENV; ray start --head --node-ip-address=$HEAD_IP --port=6379 $HEADFLAGS" 180 2>&1); then
+if ! out=$(inbox "$HEAD_ENVPASS source $CENV; ray start --head --node-ip-address=$HEAD_IP --port=6379 $HEADFLAGS" 180 2>&1); then
   echo "!! box1 ray start failed:"; echo "$out" | tail -5 | sed 's/^/     /'; exit 1
 fi
 echo "   box1 head up"
-if ! out=$(box2 "podman exec -u 1000:1000 -w \$HOME $CTR bash -lc '$ENVPASS source $CENV; ray start --address=$HEAD_IP:6379 --node-ip-address=$WORKER_IP $RAYFLAGS'" 180 2>&1); then
+if ! out=$(box2 "podman exec -u 1000:1000 -w \$HOME $CTR bash -lc '$WORKER_ENVPASS source $CENV; ray start --address=$HEAD_IP:6379 --node-ip-address=$WORKER_IP $RAYFLAGS'" 180 2>&1); then
   echo "!! box2 ray start failed:"; echo "$out" | tail -5 | sed 's/^/     /'; exit 1
 fi
 echo "   box2 worker up"
@@ -112,7 +118,7 @@ echo "== serve =="
 systemd-run --user --unit="$UNIT" --description="DS4 vLLM TP=2 (disk KV)" \
   --working-directory="$HOME" \
   /usr/bin/podman exec -u 1000:1000 -w "$HOME" "$CTR" bash -lc \
-  "$ENVPASS export DS4_TRANSPORT=$TRANSPORT DS4_DISK_KV=$DISK_KV DS4_DISK_KV_BYTES=$DISK_KV_BYTES DS4_KV_BYTES=$KV_BYTES DS4_GPU_UTIL=$GPU_UTIL DS4_MODEL=$MODEL DS4_API_PORT=$PORT DS4_MAX_CTX=$MAX_CTX; exec bash $SERVE" >/dev/null 2>&1
+  "$HEAD_ENVPASS export DS4_TRANSPORT=$TRANSPORT DS4_DISK_KV=$DISK_KV DS4_DISK_KV_BYTES=$DISK_KV_BYTES DS4_KV_BYTES=$KV_BYTES DS4_GPU_UTIL=$GPU_UTIL DS4_MODEL=$MODEL DS4_API_PORT=$PORT DS4_MAX_CTX=$MAX_CTX; exec bash $SERVE" >/dev/null 2>&1
 
 # Warm bringup answers in ~4 min; a cold kernel-cache bringup (first after a
 # cache wipe) spends ~25 min more in Triton/LLVM compiles before the API is up.
@@ -138,8 +144,8 @@ echo "== verify =="
 journalctl --user -u "$UNIT.service" --no-pager -o cat --since "-20min" 2>/dev/null \
   | grep -aE "GPU KV cache size|Maximum concurrency" | tail -2 | sed 's/^/   /'
 rdma=$(journalctl --user -u "$UNIT.service" --no-pager -o cat --since "-20min" 2>/dev/null \
-  | grep -aoE "tbv_ar2: rank[0-9] ready \(qpn=[0-9]+ peer_qpn=[0-9]+\)" | head -1)
-echo "   RDMA: ${rdma:-!! tbv_ar2 NOT ready -- decode all-reduce is not on RDMA}"
+  | grep -aoE "(tbv_ar2|odl_ar2): rank[0-9] ready[^\"]*" | head -1)
+echo "   fast AR: ${rdma:-!! tbv_ar2/odl_ar2 NOT ready -- decode all-reduce is on the slow path}"
 echo "   vllm serve procs: $(ps -eo cmd --no-headers | grep -c 'bin/[v]llm serve deepseek') (want 1)"
 echo "   ray idle workers: $(ps -eo cmd --no-headers | grep -c '[r]ay::IDLE')"
 echo "   MemAvailable: $(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo)MB"
