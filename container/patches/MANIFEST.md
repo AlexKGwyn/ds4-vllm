@@ -3,7 +3,7 @@
 All changes are a single overlay on the **`kyuz0/vllm-therock-gfx1151`** base
 (pinned digest `sha256:25fd294f…`, which ships vLLM commit **`470229c`**).
 
-- **35 modified** files — shipped as `vllm-upstream.patch` in this folder, applied to the base's own sources at image build
+- **36 modified** files — shipped as `vllm-upstream.patch` in this folder, applied to the base's own sources at image build
   (`*.patch`, base → patched). The Dockerfile does **not** apply these; it
   `COPY`s the final files from `../rootfs`. The diffs are here for review so a
   reader can see exactly what changed versus upstream.
@@ -36,8 +36,6 @@ modules and the aiter config).
 | `vllm/v1/attention/ops/rocm_aiter_mla_sparse.py` | +288/-148 | ROCm sparse-MLA top-512 attention, writer-aware indexer-cache layout, deterministic selection/order, and bounded prefill JIT specialization (largest rewrite); `DS4_FUSE_ATTN_OUT` decode reduce kernel writes the caller's output buffer directly |
 | `ds4_topk.py` *(venv top-level)* | **new (457)** | deterministic radix-select top-k for the sparse indexer: ascending output removes the second sort, no full-row sort, no transient scratch. 2.7x at decode 128K, 10.2x at prefill 228K. `DS4_TOPK=0` restores the two-sort path |
 | `ds4_tl_indexer.py` *(venv top-level)* | **new (614)** | TileLang indexer + official QAT scoring (`DS4_IDX_OFFICIAL`); also the `w8a8_block_fp8_bf16` fast GEMM helper, which serves decode and (reusing the cache decode populates) prefill; `DS4_FUSE_IDXGATHER` fused decode gather+dequant+pad |
-| `ds4_synctrace.py` *(venv top-level)* | **new (93)** | attributes blocking device->host syncs to python call sites by wrapping only the Tensor methods that can force a D2H (~25 events/step, versus ~3,200 for `with_stack=True`, which pegs the worker). Driven from `ds4_tl_indexer._maybe_profile`, so it shares the `DS4_PROFILE` window and needs no new env var |
-| `ds4_expert_union.py` *(venv top-level)* | **new (128)** | `DS4_EXPERT_UNION=1` probe: counts DISTINCT experts per MoE routing call, to measure the expert union a decode step actually touches (the free term in the decode roof). Wraps `make_routing_data`; vLLM's own `--enable-return-routed-experts` cannot see this model, whose routing never reaches `BaseRouter.route()`. Device-only accumulation, no per-step sync. Inert unless enabled |
 
 ## MoE / GEMM kernel tuning
 | file | Δ | purpose |
@@ -52,7 +50,9 @@ modules and the aiter config).
 ## Decode kernel dispatch / fusion
 | file | Δ | purpose |
 |---|---|---|
-| `vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py` | +19 | `DS4_TINY_ROUTING` hook: route tiny decode batches through the single-kernel MoE routing in `ds4_tiny_routing` |
+| `vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py` | +69 | `DS4_TINY_ROUTING` hook: route tiny decode batches through the single-kernel MoE routing in `ds4_tiny_routing`; and dispatch small-M decode to the hand-written MXFP4 path in `ds4_moe_hip` |
+| `ds4_moe_hip.py` *(venv top-level)* | **new** | ctypes wrapper for `libds4moe.so` (source `container/native/ds4_moe_mxfp4.cpp`): hand-written MXFP4 MoE decode — gemm1 + fused SILU/clamp + gemm2 with fused scatter. Validates the real shapes and strides on first use and records `disabled_reason` rather than running on a layout it does not recognise |
+| `ds4_hip_gemv.py` *(venv top-level)* | **new** | ctypes wrapper for `libds4fp8gemv.so` (source `container/native/ds4_fp8_gemv_hip.cpp`): dense fp8 decode GEMV, replacing a bf16 path that reads twice the bytes |
 | `ds4_tiny_routing.py` *(venv top-level)* | **new (174)** | single-kernel MoE routing for tiny decode batches (replaces the 5-launch bitmatrix pipeline; bit-exact, cached output buffers). `DS4_TINY_ROUTING=1` enables |
 | `vllm/__init__.py` | +12 | import hook for the `DS4_FAST_TRITON` cached Triton launcher |
 | `ds4_fast_triton.py` *(venv top-level)* | **new (217)** | per-callsite cached fast path for `JITFunction.run`: caches the compiled kernel + grid per specialization key and relaunches via `CompiledKernel.run`, skipping the binder/specialization Python. The key strictly refines triton's own specialization inputs, so a hit can never select a different kernel. `DS4_FAST_TRITON=1` enables |
@@ -93,7 +93,8 @@ modules and the aiter config).
 ## OpenAI API: reasoning + tools
 | file | Δ | purpose |
 |---|---|---|
-| `vllm/tokenizers/deepseek_v4_encoding.py` | +18/-3 | retain prior assistant reasoning (`reasoning_content`) on tool conversations — the "vLLM drops reasoning" fix |
+| `vllm/tokenizers/deepseek_v4_encoding.py` | +57/-12 | retain prior assistant reasoning (`reasoning_content`) on tool conversations — the "vLLM drops reasoning" fix; and backport upstream's `REASONING_EFFORT_PROMPTS` table so every effort level renders (this base emitted a preamble only for `max` and silently ignored `high`) |
+| `vllm/tokenizers/deepseek_v4.py` | +2 | route `reasoning_effort="low"` to the `low` table entry instead of collapsing it to `high` |
 | `vllm/v1/structured_output/__init__.py` | +47/-20 | fix `</think>` boundary so the grammar engages after reasoning |
 | `vllm/entrypoints/openai/chat_completion/protocol.py` | +10 | reasoning/tool protocol fields |
 | `vllm/entrypoints/openai/engine/protocol.py` | +9 | engine protocol fields |

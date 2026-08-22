@@ -1646,13 +1646,29 @@
      )
 --- a/opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/experts/gpt_oss_triton_kernels_moe.py
-@@ -232,6 +232,17 @@
+@@ -232,6 +232,33 @@
  # whether `SparseMatrix` is importable.
  use_legacy_triton_kernels = False
  
 +# DS4: latched at import (matches every other DS4_* flag; must agree on both
 +# TP ranks via the cluster env files).
 +import os as _ds4_os
++
++# DS4 gfx1151: hand-written MXFP4 decode path. Falls through to matmul_ogs
++# whenever it does not apply, so a missing library or an unexpected layout
++# costs speed, never correctness.
++_DS4_MOE_HIP = None
++
++
++def _ds4_moe_hip_mod():
++    global _DS4_MOE_HIP
++    if _DS4_MOE_HIP is None:
++        try:
++            import ds4_moe_hip as _m
++            _DS4_MOE_HIP = _m
++        except Exception:
++            _DS4_MOE_HIP = False
++    return _DS4_MOE_HIP
 +_DS4_TINY_ROUTING = _ds4_os.environ.get("DS4_TINY_ROUTING") == "1"
 +if _DS4_TINY_ROUTING:
 +    try:
@@ -1664,7 +1680,7 @@
  if has_triton_kernels():
      try:
          import triton_kernels.swiglu
-@@ -508,6 +519,14 @@
+@@ -508,6 +535,14 @@
      topk_weights: torch.Tensor,
      num_local_experts: int,
  ) -> tuple["RoutingData", torch.Tensor, torch.Tensor]:
@@ -1679,6 +1695,54 @@
      topk_ids = topk_ids.to(torch.int16)
      topk_weights = topk_weights.to(torch.bfloat16)
  
+@@ -714,6 +749,23 @@
+         if global_num_experts == -1:
+             global_num_experts = local_num_experts
+ 
++        # DS4: hand-written MXFP4 decode path. DeepSeek-V4-Flash's MoE uses
++        # SILU with the gate/up halves CONCATENATED -- not the gpt-oss SWIGLUOAI
++        # this file is otherwise written around, which is a different function
++        # and one this kernel refuses. No LoRA and no input-side router
++        # weighting, which is what makes the fused activation + scatter
++        # equivalent to the matmul_ogs pair.
++        _hg = _ds4_moe_hip_mod()
++        if (_hg and activation == MoEActivation.SILU
++                and not apply_router_weight_on_input
++                and getattr(self, "_lora_context", None) is None
++                and _hg.eligible(hidden_states.shape[0], hidden_states, w1, w2,
++                                 output, self.quant_config,
++                                 activation=activation)):
++            _hg.fused_experts(output, hidden_states, w1, w2, topk_weights,
++                              topk_ids, self.quant_config, tag="OAITritonExperts")
++            return output
++
+         routing_data, gather_indx, scatter_indx = self._make_routing_data(
+             topk_ids, topk_weights, local_num_experts
+         )
+@@ -844,6 +896,23 @@
+         if global_num_experts == -1:
+             global_num_experts = local_num_experts
+ 
++        # DS4: hand-written MXFP4 decode path. DeepSeek-V4-Flash's MoE uses
++        # SILU with the gate/up halves CONCATENATED -- not the gpt-oss SWIGLUOAI
++        # this file is otherwise written around, which is a different function
++        # and one this kernel refuses. No LoRA and no input-side router
++        # weighting, which is what makes the fused activation + scatter
++        # equivalent to the matmul_ogs pair.
++        _hg = _ds4_moe_hip_mod()
++        if (_hg and activation == MoEActivation.SILU
++                and not apply_router_weight_on_input
++                and getattr(self, "_lora_context", None) is None
++                and _hg.eligible(hidden_states.shape[0], hidden_states, w1, w2,
++                                 output, self.quant_config,
++                                 activation=activation)):
++            _hg.fused_experts(output, hidden_states, w1, w2, topk_weights,
++                              topk_ids, self.quant_config, tag="UnfusedOAITritonExperts")
++            return output
++
+         routing_data, gather_indx, scatter_indx = self._make_routing_data(
+             topk_ids, topk_weights, local_num_experts
+         )
 --- a/opt/venv/lib/python3.12/site-packages/vllm/__init__.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/__init__.py
 @@ -13,6 +13,18 @@
@@ -2964,7 +3028,51 @@
          cpu_tensors: list[torch.Tensor] = []
 --- a/opt/venv/lib/python3.12/site-packages/vllm/tokenizers/deepseek_v4_encoding.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/tokenizers/deepseek_v4_encoding.py
-@@ -255,7 +255,7 @@
+@@ -67,11 +67,38 @@
+     "<tool_result>{content}</tool_result>"
+ )
+ 
+-REASONING_EFFORT_MAX = (
+-    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+-    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+-    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+-)
++# Backported from a later vLLM so every effort level renders. The encoder in
++# this base emitted a preamble only for 'max' and silently ignored "high" --
++# and its dispatcher normalises anything unrecognised to "high", so a server
++# started with reasoning_effort=high got NO preamble and no error, just a
++# prompt 79 tokens shorter than intended and a model reasoning in its unprimed
++# voice. Upstream later renamed that same string to "high" and added a new,
++# stronger "max"; both are reproduced verbatim below.
++REASONING_EFFORT_PROMPTS: Dict[str, str] = {
++    "low": "",
++    "high": (
++        "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
++        "You MUST be very thorough in your thinking and comprehensively "
++        "decompose the problem to resolve the root cause, rigorously "
++        "stress-testing your logic against all potential paths, edge cases, "
++        "and adversarial scenarios.\n"
++        "Explicitly write out your entire deliberation process, documenting "
++        "every intermediate step, considered alternative, and rejected "
++        "hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
++    ),
++    "max": (
++        "Reasoning Effort: Beyond maximum — exhaustive, relentless, and "
++        "uncompromising.\n"
++        "You MUST reason with the utmost depth and rigor, leaving absolutely "
++        "nothing to chance: exhaustively decompose the problem into its most "
++        "fundamental components, trace every causal chain to its root, and "
++        "resolve the underlying cause rather than any surface symptom.\n"
++        "Do not stop reasoning until you have independently verified the "
++        "solution from multiple angles and are certain that no assumption "
++        "remains unchecked and no error remains undiscovered.\n\n"
++    ),
++}
++DEFAULT_REASONING_EFFORT = "low"
+ 
+ TOOLS_TEMPLATE = """## Tools
+ 
+@@ -255,7 +282,7 @@
      tools = msg.get("tools")
      response_format = msg.get("response_format")
      tool_calls = msg.get("tool_calls")
@@ -2973,7 +3081,25 @@
      wo_eos = msg.get("wo_eos", False)
  
      if tools:
-@@ -551,9 +551,23 @@
+@@ -263,10 +290,13 @@
+     if tool_calls:
+         tool_calls = tool_calls_from_openai_format(tool_calls)
+ 
+-    # Reasoning effort prefix (only at index 0 in thinking mode with max effort)
+-    assert reasoning_effort in ['max', None, 'high'], f"Invalid reasoning effort: {reasoning_effort}"
+-    if index == 0 and thinking_mode == "thinking" and reasoning_effort == 'max':
+-        prompt += REASONING_EFFORT_MAX
++    reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
++    assert reasoning_effort in REASONING_EFFORT_PROMPTS, (
++        f"Invalid reasoning effort: {reasoning_effort}, expected one of "
++        f"{list(REASONING_EFFORT_PROMPTS)}"
++    )
++    if index == 0 and thinking_mode == "thinking":
++        prompt += REASONING_EFFORT_PROMPTS[reasoning_effort]
+ 
+     if role == "system":
+         prompt += system_msg_template.format(content=content or "")
+@@ -551,9 +581,23 @@
  
      prompt = bos_token if add_default_bos_token and len(context) == 0 else ""
  
@@ -2999,13 +3125,24 @@
          effective_drop_thinking = False
  
      if thinking_mode == "thinking" and effective_drop_thinking:
-@@ -599,6 +613,7 @@
+@@ -599,6 +643,7 @@
          elif role == "assistant":
              msg = copy.copy(msg)
              msg.pop("reasoning", None)
 +            msg.pop("reasoning_content", None)
              result.append(msg)
          # developer and other roles before last_user_idx are dropped
+ 
+--- a/opt/venv/lib/python3.12/site-packages/vllm/tokenizers/deepseek_v4.py
++++ b/opt/venv/lib/python3.12/site-packages/vllm/tokenizers/deepseek_v4.py
+@@ -48,6 +48,8 @@
+                 reasoning_effort = None
+             elif reasoning_effort in ("max", "xhigh"):
+                 reasoning_effort = "max"
++            elif reasoning_effort == "low":
++                reasoning_effort = "low"
+             else:
+                 reasoning_effort = "high"
  
 --- a/opt/venv/lib/python3.12/site-packages/vllm/v1/structured_output/__init__.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/v1/structured_output/__init__.py

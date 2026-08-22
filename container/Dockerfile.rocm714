@@ -40,7 +40,18 @@ RUN /opt/venv/bin/pip uninstall -y \
 #     same tree, so re-copying here keeps the overlay authoritative.
 COPY --chown=root:root container/rootfs/ /
 
-# 2) ABI-reuse smoke gate: torch must import and report the stable versions,
+# 2) Recompile the decode kernels with the stable hipcc so the HIP runtime they
+#    link matches the wheels now in the venv.
+COPY --chown=root:root container/native/ /tmp/ds4-native/
+RUN /opt/venv/bin/hipcc -O3 --offload-arch=gfx1151 -shared -fPIC \
+      -o /opt/venv/lib/python3.12/site-packages/libds4moe.so \
+      /tmp/ds4-native/ds4_moe_mxfp4.cpp && \
+    /opt/venv/bin/hipcc -O3 --offload-arch=gfx1151 -shared -fPIC \
+      -o /opt/venv/lib/python3.12/site-packages/libds4fp8gemv.so \
+      /tmp/ds4-native/ds4_fp8_gemv_hip.cpp && \
+    rm -rf /tmp/ds4-native
+
+# 3) ABI-reuse smoke gate: torch must import and report the stable versions,
 #    and the existing vLLM wheel must import against the stable torch.
 #    (No GPU inside the build; CPU-side import only.)
 RUN /opt/venv/bin/python - <<'EOF'

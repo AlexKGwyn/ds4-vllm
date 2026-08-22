@@ -150,7 +150,7 @@ cd container
 ```
 
 This does `FROM docker.io/kyuz0/vllm-therock-gfx1151@<pinned-digest>`, applies
-`container/patches/vllm-upstream.patch` to the base's own vLLM sources (35
+`container/patches/vllm-upstream.patch` to the base's own vLLM sources (36
 files), overlays the 15 new files from `container/rootfs/`
 (see [`container/patches/MANIFEST.md`](container/patches/MANIFEST.md)), builds
 the OdinLink userspace (the RCCL net plugin and the `odl_ar2` all-reduce, both
@@ -275,6 +275,17 @@ The themes:
 - **Mid-context retrieval** — the sparse indexer runs the *official* QAT graph
   (Hadamard128 + FP4 sim) before top-512 scoring (`DS4_IDX_OFFICIAL`), which the
   stock FP8 indexer skipped; plus a ROCm sparse-MLA attention rewrite.
+- **Hand-written decode kernels** — an MXFP4 MoE decode path (gemm1 + fused
+  SILU/clamp + gemm2 with fused scatter, one contiguous march per workgroup
+  instead of the against-the-grain tile the stock path reads) and a dense fp8
+  GEMV that replaces a bf16 path reading twice the bytes. Both are ctypes
+  wrappers over libraries built in-image from `container/native/`, and both fall
+  back to the stock path on any layout they do not recognise, so a missing
+  library costs speed and never correctness.
+- **Reasoning effort levels** — `low` / `high` / `max` / `none` all render.
+  The encoder in the base image emitted a preamble only for `max` and silently
+  ignored `high`, so a server configured for high reasoning got no preamble and
+  no error; upstream's table is backported so the setting means something.
 - **MoE / GEMM tuning** — decode-scoped MXFP4 `matmul_ogs` knobs
   (`DS4_MOE_BN/NW/NS/BK/WPE`, the `block_k` bandwidth lever), a tuned gfx1151
   A8W8 GEMM config, and a `DS4_W8A8_BF16` fast bf16 path.

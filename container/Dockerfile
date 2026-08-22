@@ -4,9 +4,9 @@
 # TheRock/ROCm gfx1151 base image — the exact base the patches were developed
 # against. The base already contains the full ROCm 7 + PyTorch + vLLM build
 # (vLLM commit 470229c); this file applies the DeepSeek-V4 / DSpark patch
-# (patches/vllm-upstream.patch, 35 files), overlays the 15 new files from
+# (patches/vllm-upstream.patch, 36 files), overlays the 15 new files from
 # ./rootfs, builds the OdinLink userspace (the RCCL net plugin and the odl_ar2
-# all-reduce), and rebuilds ROCr. Third-party sources are FETCHED at pinned
+# all-reduce) and the hand-written decode kernels, and rebuilds ROCr. Third-party sources are FETCHED at pinned
 # commits, not vendored (network needed on first build).
 #
 # Build (context is the REPO ROOT):
@@ -82,7 +82,7 @@ RUN git clone https://github.com/Geramy/OdinLink-Five /tmp/odinlink && \
 
 FROM ${DS4_BASE}
 
-# Apply the vLLM patch-set to the base's own sources (35 files), then overlay
+# Apply the vLLM patch-set to the base's own sources (36 files), then overlay
 # the 15 new files from rootfs/ (which mirrors "/"). The patch is the same
 # reviewable diff in patches/; container/verify-patches.sh proves it applies.
 COPY container/patches/vllm-upstream.patch /tmp/
@@ -107,6 +107,19 @@ RUN ln -s libodl_tb5.so.0.1.0 /usr/local/lib/odinlink/libodl_tb5.so.0 && \
 COPY --from=odinlink-build --chown=root:root \
   /tmp/odinlink/build/libodl_ar2.so \
   /opt/venv/lib/python3.12/site-packages/libodl_ar2.so
+
+# Build the decode kernels that ds4_moe_hip.py / ds4_hip_gemv.py ctypes-load.
+# rootfs/ carries only the python wrappers: without these libraries each wrapper
+# records a `disabled_reason` and the engine quietly uses the stock path, so a
+# missing build here costs decode speed without failing anything.
+COPY --chown=root:root container/native/ /tmp/ds4-native/
+RUN /opt/rocm/bin/hipcc -O3 --offload-arch=gfx1151 -shared -fPIC \
+      -o /opt/venv/lib/python3.12/site-packages/libds4moe.so \
+      /tmp/ds4-native/ds4_moe_mxfp4.cpp && \
+    /opt/rocm/bin/hipcc -O3 --offload-arch=gfx1151 -shared -fPIC \
+      -o /opt/venv/lib/python3.12/site-packages/libds4fp8gemv.so \
+      /tmp/ds4-native/ds4_fp8_gemv_hip.cpp && \
+    rm -rf /tmp/ds4-native
 
 # Drop stale bytecode for the packages we touched so the first import recompiles
 # from the patched sources. (COPY already writes fresh mtimes, which invalidates
