@@ -2,7 +2,13 @@
 # Load odl_tb5 (real link mode) on THIS box, unloading a stale
 # thunderbolt_ibverbs first if an older tbv deployment left one behind.
 # Run with sudo on box1, then on box2 (any order, promptly after each other).
-# Usage: odl-swap.sh [ring=4096] [e2e=1] [busy_poll_us=0] [rx_poll_ns=3000]
+# Usage: odl-swap.sh [ring=1024] [e2e=1] [busy_poll_us=0]
+#
+# Everything except ring size is left at the driver default on purpose: this
+# repo targets ONE cable between two boxes that both run OdinLink, and none of
+# the other module parameters change anything for that topology. ring=1024
+# because the 4096 ring needs a 16 MB contiguous allocation that fails without
+# a CMA pool (cma=256M on the kernel cmdline would lift it).
 set -e
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 HOME_DIR=${ODL_HOME:-}
@@ -11,12 +17,9 @@ if [ -z "$HOME_DIR" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; th
 fi
 KO=${ODL_KO:-${HOME_DIR:+$HOME_DIR/.cache/odinlink/driver/odl_tb5.ko}}
 RULE=${ODL_UDEV_RULE:-${HOME_DIR:+$HOME_DIR/.cache/odinlink/driver/71-odl-tb5.rules}}
-RING=${1:-4096}
+RING=${1:-1024}
 E2E=${2:-1}
 BUSY=${3:-0}
-RXPOLL=${4:-3000}
-BIND_ANY=${ODL_BIND_ANY:-0}
-MAX_DEVICES=${ODL_MAX_DEVICES:-1}
 [ -n "$KO" ] && [ -f "$KO" ] || { echo "no OdinLink module; set ODL_KO or ODL_HOME"; exit 1; }
 [ -n "$RULE" ] && [ -f "$RULE" ] || { echo "no OdinLink udev rule; set ODL_UDEV_RULE or ODL_HOME"; exit 1; }
 
@@ -47,8 +50,8 @@ fi
 
 rmmod odl_tb5 2>/dev/null && echo "removed old odl_tb5 (loopback)" || true
 rmmod thunderbolt_ibverbs 2>/dev/null && echo "removed thunderbolt_ibverbs" || true
-insmod "$KO" odl_ring_size=$RING e2e=$E2E odl_busy_poll_us=$BUSY rx_poll_ns=$RXPOLL bind_any=$BIND_ANY max_devices=$MAX_DEVICES
-echo "loaded odl_tb5 (real link, odl_ring_size=$RING e2e=$E2E odl_busy_poll_us=$BUSY rx_poll_ns=$RXPOLL bind_any=$BIND_ANY max_devices=$MAX_DEVICES)"
+insmod "$KO" odl_ring_size=$RING e2e=$E2E odl_busy_poll_us=$BUSY
+echo "loaded odl_tb5 (real link, odl_ring_size=$RING e2e=$E2E odl_busy_poll_us=$BUSY)"
 
 # A device node only proves probe succeeded. The RCCL plugin requires the
 # cross-host DMA handshake to reach READY, so a persistent service must not

@@ -1,55 +1,5 @@
-diff --git a/driver/odl_tb5_core.h b/driver/odl_tb5_core.h
-index ca9e4d7..375cc07 100644
---- a/driver/odl_tb5_core.h
-+++ b/driver/odl_tb5_core.h
-@@ -143,6 +143,16 @@ struct odl_tb5_stream_hdr {
-  */
- #define ODL_TB5_POLL_INTERVAL_NS	(3 * 1000)   /* 3 us */
- 
-+/* Runtime-tunable poll interval (rx_poll_ns, default above).  Clamped so a
-+ * stray 0 cannot turn the hrtimer into a hardirq spin. */
-+#define ODL_TB5_POLL_INTERVAL_MIN_NS	500
-+static inline u64 odl_tb5_poll_interval_ns(void)
-+{
-+	extern unsigned int odl_rx_poll_ns;
-+
-+	return max_t(u64, odl_rx_poll_ns, ODL_TB5_POLL_INTERVAL_MIN_NS);
-+}
-+
- /* ── SG batch buffer pool (throughput mode) ──────────────────────────── */
- 
- #define ODL_TB5_BATCH_BUF_SIZE		(256 * 1024)
-@@ -582,6 +592,7 @@ extern int odl_loopback_count;
- extern int odl_protocol_mode;
- extern bool odl_e2e;
- extern unsigned int odl_busy_poll_us;
-+extern unsigned int odl_rx_poll_ns;
- extern int odl_max_devices;
- extern bool odl_bind_any;
- extern bool odl_skip_login;
-diff --git a/driver/odl_tb5_params.c b/driver/odl_tb5_params.c
-index 68d62bd..7fa1dd5 100644
---- a/driver/odl_tb5_params.c
-+++ b/driver/odl_tb5_params.c
-@@ -49,6 +49,16 @@ module_param(odl_busy_poll_us, uint, 0644);
- MODULE_PARM_DESC(odl_busy_poll_us,
- 	"Bounded RX busy-poll window in microseconds before sleeping (0 = off)");
- 
-+/* Ring poll cadence: the hrtimer that kicks TX/RX ring_work to catch
-+ * completions whose descriptor write-back lagged the MSI-X interrupt.  It
-+ * bounds how long a completion can sit unprocessed, so it is a direct
-+ * latency/CPU trade.  Runtime-writable; values below
-+ * ODL_TB5_POLL_INTERVAL_MIN_NS are clamped up. */
-+unsigned int odl_rx_poll_ns = ODL_TB5_POLL_INTERVAL_NS;
-+module_param_named(rx_poll_ns, odl_rx_poll_ns, uint, 0644);
-+MODULE_PARM_DESC(rx_poll_ns,
-+	"TX/RX ring poll timer interval in ns (default 3000, min 500)");
-+
- /* Bind at most N XDomain services (0 = unlimited).  With two Thunderbolt
-  * cables both peer services sit at route=2 (BUG 2) and the handshake cannot
-  * complete; unbinding one afterwards runs the full teardown path, so bind
 diff --git a/driver/odl_tb5_proto.c b/driver/odl_tb5_proto.c
-index 62617b8..9d133c2 100644
+index 62617b8..668141a 100644
 --- a/driver/odl_tb5_proto.c
 +++ b/driver/odl_tb5_proto.c
 @@ -158,6 +158,25 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
@@ -78,15 +28,6 @@ index 62617b8..9d133c2 100644
  		if (dev->state != ODL_TB5_STATE_HANDSHAKE) {
  			pr_info("odl_tb5: peer restarted (our state=%d), "
  				"scheduling restart\n", dev->state);
-@@ -374,7 +393,7 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
- 	}
- 
- 	hrtimer_start(&dev->rx_poll_timer,
--		      ns_to_ktime(ODL_TB5_POLL_INTERVAL_NS),
-+		      ns_to_ktime(odl_tb5_poll_interval_ns()),
- 		      HRTIMER_MODE_REL);
- 	schedule_work(&dev->verify_work);
- 
 @@ -586,6 +605,17 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
  		       "Peer never answered the DMA ping.\n",
  		       attempt, dev->login_sent, dev->login_received,
@@ -103,28 +44,6 @@ index 62617b8..9d133c2 100644
 +			schedule_work(&dev->restart_work);
 +		}
  		goto out_reset;
- 	}
- 
-@@ -613,7 +643,7 @@ ready:
- 	 * interrupts fire but descriptor write-back can lag, so we poll
- 	 * at 50 us to keep latency low. */
- 	hrtimer_start(&dev->rx_poll_timer,
--		      ns_to_ktime(ODL_TB5_POLL_INTERVAL_NS),
-+		      ns_to_ktime(odl_tb5_poll_interval_ns()),
- 		      HRTIMER_MODE_REL);
- 
- 	pr_info("odl_tb5: entering READY state\n");
-diff --git a/driver/odl_tb5_ring_dma.c b/driver/odl_tb5_ring_dma.c
-index 61b251f..26dd0d0 100644
---- a/driver/odl_tb5_ring_dma.c
-+++ b/driver/odl_tb5_ring_dma.c
-@@ -60,7 +60,7 @@ enum hrtimer_restart odl_tb5_rx_poll_timer_fn(struct hrtimer *timer)
- 	if (dev->state >= ODL_TB5_STATE_CONNECTED &&
- 	    (dev->tx.started || dev->rx.started)) {
- 		hrtimer_forward_now(timer,
--				    ns_to_ktime(ODL_TB5_POLL_INTERVAL_NS));
-+				    ns_to_ktime(odl_tb5_poll_interval_ns()));
- 		return HRTIMER_RESTART;
  	}
  
 diff --git a/rccl/src/odl_tb5_plugin.c b/rccl/src/odl_tb5_plugin.c

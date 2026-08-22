@@ -9,7 +9,7 @@ RemainAfterExit=yes
 Environment=ODL_KO=/usr/local/lib/odinlink/odl_tb5.ko
 Environment=ODL_UDEV_RULE=/usr/local/share/odinlink/71-odl-tb5.rules
 Environment=ODL_STATE=/usr/local/bin/odl-state
-ExecStart=/usr/local/sbin/odl-swap.sh 1024 1
+ExecStart=/usr/local/sbin/odl-swap.sh
 ExecStop=/usr/sbin/rmmod odl_tb5
 TimeoutStartSec=2min
 TimeoutStopSec=1min

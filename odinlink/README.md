@@ -39,18 +39,21 @@ arguments, which otherwise leave the box with no thunderbolt driver at all.
   readiness helper, installs `odl-swap.sh` and enables `odinlink.service`
   (loads the driver at boot and gates on the cross-host handshake reaching
   READY).
-- `odl-swap.sh [ring] [e2e] [busy_poll_us] [rx_poll_ns]` — the actual load
+- `odl-swap.sh [ring] [e2e] [busy_poll_us]` — the actual load
   path, also usable by hand on a live box. Installs the udev rule, **signs
   `odl_tb5.ko` with the host's enrolled MOK when one is present**
   (`/var/lib/shim-signed/mok/`, the key DKMS enrolls; override with
   `ODL_MOK_PRIV`/`ODL_MOK_DER`), unloads any stale `thunderbolt_ibverbs`,
   loads `odl_tb5`, and waits for READY. With no
   enrolled key the signing step is a no-op and Secure Boot must be disabled.
-- `odinlink-local.patch` — our driver/plugin fixes on the pinned upstream:
-  XDomain-aware protocol demux (`callback_xd`), connection restart after
-  failed DMA verify, verify-survives-peer-relogin, the plugin's logger-ABI
-  segfault fix, and the runtime-tunable `rx_poll_ns` ring-poll cadence
-  (writable via `/sys/module/odl_tb5/parameters/rx_poll_ns`).
+- `odinlink-local.patch` — three bug fixes on the pinned upstream, and
+  nothing else. Connection restart after a failed DMA verify (without it the
+  link parks in CONNECTED and wedges until a module reload);
+  verify-survives-peer-relogin (both ends restarting otherwise phase-lock and
+  never converge); and the RCCL plugin's logger-ABI segfault, where a 2-arg
+  call into a 6-arg `ncclDebugLogger_t` made RCCL dereference the device count
+  as a filename. No tuning and no topology workarounds: every module parameter
+  except ring size is left at the driver default.
 - `ar2/` — `odl_ar2`: the decode all-reduce carried over OdinLink
   streams (HIP + ctypes wrapper). Wired into the engine by `DS4_ODL_AR2=1`
   (branch carried in `container/patches/vllm-upstream.patch`, wrapper in
@@ -82,7 +85,7 @@ bring the cluster up normally (`transport: odl` is the default in
   the same XDomain and carries the control plane (`thunderbolt0`).
 - `ring_size=1024` is the ceiling on these boxes (no CMA pool; the 4096
   ring's 16 MB contiguous alloc fails). `cma=256M` on the kernel cmdline
-  would lift it. The systemd unit loads with `1024 1`.
+  would lift it. `odl-swap.sh` defaults to 1024 for that reason.
 - The driver is vermagic-locked to the running kernel: rebuild it after a
   kernel update.
 - Measure decode with non-streamed `usage.completion_tokens`: SSE chunks
