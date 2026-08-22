@@ -2,7 +2,7 @@
 # OdinLink-transport env for the DS4 vLLM cluster (`transport: odl` in
 # ds4-config.yaml). Runs the 2-box cluster with RCCL's net plugin backed by
 # the odl_tb5 kernel driver (/dev/odl_tb5_*) instead of the usb4_rdma ibverbs
-# HCA. IB and the tbv_ar all-reduce are disabled; the decode all-reduce goes
+# HCA. IB is disabled; the decode all-reduce goes
 # through odl_ar2 and every other collective through the plugin. Bring the
 # link up first: odinlink/README.md.
 source "$HOME/ds4-cluster-env.sh"
@@ -20,7 +20,7 @@ export NCCL_SOCKET_IFNAME=${DS4_CONTROL_IFACE:-thunderbolt0}
 export GLOO_SOCKET_IFNAME=${DS4_CONTROL_IFACE:-thunderbolt0}
 export DS4_TBV_AR=0
 export DS4_TBV_AR2=0
-# odl_ar2: tbv_ar2-class decode all-reduce over the OdinLink stream API
+# odl_ar2: decode all-reduce over the OdinLink stream API
 # (rootfs odl_ar2.py + in-image libodl_ar2.so). The rendezvous rides TCP:
 # rank1 listens on odl_rank1_ip (defaults to worker_ip via the restart
 # script), rank0 connects out.

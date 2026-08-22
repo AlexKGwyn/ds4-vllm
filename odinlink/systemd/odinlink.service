@@ -2,7 +2,6 @@
 Description=OdinLink transport for the DS4 dual-node cluster
 After=network.target
 Before=ds4-vllm.service
-Conflicts=tbv-roce.service
 
 [Service]
 Type=oneshot

@@ -124,7 +124,7 @@ fi
 # interrupts, so latency-sensitive finite waits preserve upstream behavior.
 # Set DS4_HSA_MWAITX=1 to use MONITORX/MWAITX during those finite waits.
 export HSA_ENABLE_MWAITX=${DS4_HSA_MWAITX:-0}
-# GPU-direct all-reduce: tbv_ar v1 data slots live in DEVICE memory as
+# GPU-direct all-reduce: data slots live in DEVICE memory as
 # dma-buf MRs (RDMA lands straight in GPU pages; flags stay host-side for the
 # CPU spin). Bit-exact and faster than host staging. Set 0 to fall back to
 # pinned-host staging.

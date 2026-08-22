@@ -12,13 +12,13 @@ host/bench/*_capture*.json
 host/moe_tune/runs/
 ray-tmp/
 # kernel module build artifacts (rebuilt per kernel)
-tbv/**/*.ko
-tbv/**/*.o
-tbv/**/*.mod
-tbv/**/*.mod.c
-tbv/**/*.cmd
-tbv/**/.*.cmd
-tbv/**/Module.symvers
-tbv/**/modules.order
+odinlink/**/*.ko
+odinlink/**/*.o
+odinlink/**/*.mod
+odinlink/**/*.mod.c
+odinlink/**/*.cmd
+odinlink/**/.*.cmd
+odinlink/**/Module.symvers
+odinlink/**/modules.order
 host/bench/perf_ab/results/
 __pycache__/

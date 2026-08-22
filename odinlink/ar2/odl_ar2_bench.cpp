@@ -15,10 +15,10 @@
 //      per-op latency = host wall time around [enqueue + hipStreamSynchronize].
 //
 // Sizes: DeepSeek-V4-Flash decode all-reduces hidden states of 4096 bf16
-// (8 KiB/token); the production decode collective carried by tbv_ar2 is
+// (8 KiB/token); the production decode collective is
 // 48 KiB per op (6 tokens/step with the 3-stage MTP drafter — see the
-// cuda_communicator hook comment in vllm-upstream.patch). 48 KiB is the
-// headline number to compare against tbv_ar2's ~105 us.
+// cuda_communicator hook comment in vllm-upstream.patch), so 48 KiB is the
+// size to watch.
 //
 // Build (inside the vllm container):
 //   hipcc -O2 --offload-arch=gfx1151 -o odl_ar2_bench odl_ar2.hip odl_ar2_bench.cpp \

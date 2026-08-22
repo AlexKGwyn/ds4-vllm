@@ -1,16 +1,7 @@
 diff --git a/driver/odl_tb5_core.h b/driver/odl_tb5_core.h
-index ca9e4d7..f26a03a 100644
+index ca9e4d7..375cc07 100644
 --- a/driver/odl_tb5_core.h
 +++ b/driver/odl_tb5_core.h
-@@ -20,7 +20,7 @@
- 
- #include <linux/module.h>
- #if IS_ENABLED(CONFIG_USB4)
--#include <linux/thunderbolt.h>
-+#include "thunderbolt-tbv.h" /* tbv-patched module ABI, NOT stock <linux/thunderbolt.h> */
- #endif
- #include <linux/cdev.h>
- #include <linux/dma-buf.h>
 @@ -143,6 +143,16 @@ struct odl_tb5_stream_hdr {
   */
  #define ODL_TB5_POLL_INTERVAL_NS	(3 * 1000)   /* 3 us */
@@ -58,47 +49,10 @@ index 68d62bd..7fa1dd5 100644
   * cables both peer services sit at route=2 (BUG 2) and the handshake cannot
   * complete; unbinding one afterwards runs the full teardown path, so bind
 diff --git a/driver/odl_tb5_proto.c b/driver/odl_tb5_proto.c
-index 62617b8..c7f3b0c 100644
+index 62617b8..9d133c2 100644
 --- a/driver/odl_tb5_proto.c
 +++ b/driver/odl_tb5_proto.c
-@@ -60,8 +60,20 @@ static struct odl_tb5_device *odl_tb5_find_device_by_route(u64 route)
- 	return NULL;
- }
- 
--static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
--				       void *data)
-+static struct odl_tb5_device *odl_tb5_find_device_by_xd(const struct tb_xdomain *xd)
-+{
-+	struct odl_tb5_device *dev;
-+
-+	list_for_each_entry(dev, &odl_tb5_devices_list, list) {
-+		if (dev->transport->type == ODL_TB5_TRANSPORT_NHI &&
-+		    dev->xd == xd)
-+			return dev;
-+	}
-+	return NULL;
-+}
-+
-+static int odl_tb5_proto_handle_packet_common(struct tb_xdomain *src_xd,
-+					      const void *buf, size_t size)
- {
- 	const struct odl_tb5_xd_header *hdr = buf;
- 	struct odl_tb5_device *dev;
-@@ -74,7 +86,12 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
- 	route = (((u64)hdr->route_hi << 32) | hdr->route_lo) & ~BIT_ULL(63);
- 
- 	mutex_lock(&odl_tb5_devices_lock);
--	dev = odl_tb5_find_device_by_route(route);
-+	/* Routes are domain-local and repeat across domains on multi-cable
-+	 * hosts (two point-to-point links both see the peer at the same
-+	 * route), so route-only demux cross-wires the links. Prefer the
-+	 * source xdomain when the core provides it (callback_xd). */
-+	dev = src_xd ? odl_tb5_find_device_by_xd(src_xd)
-+		     : odl_tb5_find_device_by_route(route);
- 
- 	if (!dev) {
- 		mutex_unlock(&odl_tb5_devices_lock);
-@@ -158,6 +175,25 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
+@@ -158,6 +158,25 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
  			dev->transport->local_tx_hopid(dev));
  
  		mutex_lock(&dev->state_lock);
@@ -124,34 +78,7 @@ index 62617b8..c7f3b0c 100644
  		if (dev->state != ODL_TB5_STATE_HANDSHAKE) {
  			pr_info("odl_tb5: peer restarted (our state=%d), "
  				"scheduling restart\n", dev->state);
-@@ -203,9 +239,24 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
- 	}
- }
- 
-+static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
-+				       void *data)
-+{
-+	return odl_tb5_proto_handle_packet_common(NULL, buf, size);
-+}
-+
-+static int odl_tb5_proto_handle_packet_xd(struct tb_xdomain *xd,
-+					  const void *buf, size_t size,
-+					  void *data)
-+{
-+	return odl_tb5_proto_handle_packet_common(xd, buf, size);
-+}
-+
- static struct tb_protocol_handler odl_tb5_handler = {
--	.uuid     = &odl_tb5_proto_uuid,
--	.callback = odl_tb5_proto_handle_packet,
-+	.uuid        = &odl_tb5_proto_uuid,
-+	.callback    = odl_tb5_proto_handle_packet,
-+	.callback_xd = odl_tb5_proto_handle_packet_xd,
-+	.owner       = THIS_MODULE,
- };
- 
- int odl_tb5_proto_register(void)
-@@ -374,7 +425,7 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
+@@ -374,7 +393,7 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
  	}
  
  	hrtimer_start(&dev->rx_poll_timer,
@@ -160,7 +87,7 @@ index 62617b8..c7f3b0c 100644
  		      HRTIMER_MODE_REL);
  	schedule_work(&dev->verify_work);
  
-@@ -586,6 +637,17 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
+@@ -586,6 +605,17 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
  		       "Peer never answered the DMA ping.\n",
  		       attempt, dev->login_sent, dev->login_received,
  		       dev->remote_tx_hopid, tx_info.hop, rx_info.hop);
@@ -178,7 +105,7 @@ index 62617b8..c7f3b0c 100644
  		goto out_reset;
  	}
  
-@@ -613,7 +675,7 @@ ready:
+@@ -613,7 +643,7 @@ ready:
  	 * interrupts fire but descriptor write-back can lag, so we poll
  	 * at 50 us to keep latency low. */
  	hrtimer_start(&dev->rx_poll_timer,

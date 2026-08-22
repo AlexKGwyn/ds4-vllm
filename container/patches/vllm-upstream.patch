@@ -1762,14 +1762,14 @@
          gate = torch.clamp(x[..., :d], max=self.swiglu_limit)
 --- a/opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/cuda_communicator.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/cuda_communicator.py
-@@ -252,6 +252,80 @@
+@@ -252,6 +252,29 @@
          )
  
      def all_reduce(self, input_):
-+        # DS4_ODL_AR2=1: tbv_ar2-equivalent all-reduce over the OdinLink
-+        # stream API (libodl_ar2 / odl_tb5). Same 2-rank gating and
-+        # eligibility as DS4_TBV_AR2 below; decode-sized ops take this path,
-+        # prefill falls through to RCCL (over the OdinLink net plugin).
++        # DS4_ODL_AR2=1: 2-rank decode all-reduce over the OdinLink stream
++        # API (libodl_ar2 / odl_tb5). Decode-sized ops take this path; larger
++        # prefill all-reduces are ineligible and fall through to RCCL, which
++        # itself rides the OdinLink net plugin.
 +        import os as _os3
 +        if _os3.environ.get("DS4_ODL_AR2") == "1" and not getattr(self, "_odl2_failed", False):
 +            _q3 = getattr(self, "_odl_ar2", None)
@@ -1789,57 +1789,6 @@
 +            if _q3 is not None and _q3.eligible(input_):
 +                _r3 = torch.empty_like(input_)
 +                return _q3.all_reduce_out(input_, _r3)
-+        # DS4_TBV_AR2=1: v2 GPU-poll + progress-thread RDMA all-reduce, fully
-+        # stream-async. Takes precedence over v1. Same eligibility/2-rank gating;
-+        # falls through to the normal chain when ineligible. Carries the decode
-+        # collective (48 KiB, under TBV2_MAX_BYTES=1MiB); prefill's ~4 MiB
-+        # all-reduces exceed that and go to RCCL-over-IB. Per-op latency here is
-+        # UNMEASURED on the current stack -- do not quote a figure without
-+        # re-running tbv/build-scripts/verify-tbv-perf.sh.
-+        import os as _os2
-+        if _os2.environ.get("DS4_TBV_AR2") == "1" and not getattr(self, "_tbv2_failed", False):
-+            _t2 = getattr(self, "_tbv_ar2", None)
-+            if _t2 is None:
-+                try:
-+                    import torch.distributed as _d2
-+                    if _d2.get_world_size(group=self.device_group) == 2:
-+                        from tbv_ar2 import TbvAllReduce2
-+                        self._tbv_ar2 = _t2 = TbvAllReduce2(
-+                            _d2.get_rank(group=self.device_group))
-+                    else:
-+                        self._tbv2_failed = True
-+                except Exception as _e2:
-+                    import logging
-+                    logging.getLogger(__name__).warning("tbv_ar2 init failed: %s", _e2)
-+                    self._tbv2_failed = True
-+            if _t2 is not None and _t2.eligible(input_):
-+                _o2 = torch.empty_like(input_)
-+                return _t2.all_reduce_out(input_, _o2)
-+        # DS4_TBV_AR=1: direct 2-rank RDMA-write all-reduce over the usb4_rdma
-+        # link (libtbv_ar). Superseded by v2 above and currently inert -- it
-+        # fails init with "slot tensor not page-aligned" and only ever saw inputs
-+        # v2 declined. Decode-sized contiguous tensors only; falls through to the
-+        # normal chain for prefill/capture/ineligible inputs. The old
-+        # "228us vs 450us for RCCL" comparison was never measured on this stack.
-+        import os as _os
-+        if _os.environ.get("DS4_TBV_AR") == "1" and not getattr(self, "_tbv_failed", False):
-+            _tbv = getattr(self, "_tbv_ar", None)
-+            if _tbv is None:
-+                try:
-+                    import torch.distributed as _dist
-+                    if _dist.get_world_size(group=self.device_group) == 2:
-+                        from tbv_ar import TbvAllReduce
-+                        self._tbv_ar = _tbv = TbvAllReduce(
-+                            _dist.get_rank(group=self.device_group))
-+                    else:
-+                        self._tbv_failed = True
-+                except Exception as _e:
-+                    import logging
-+                    logging.getLogger(__name__).warning("tbv_ar init failed: %s", _e)
-+                    self._tbv_failed = True
-+            if _tbv is not None and _tbv.eligible(input_):
-+                _out = torch.empty_like(input_)
-+                return _tbv.all_reduce_out(input_, _out)
          # since currently we perform copy input -> symm_input -> out-of-place AR
          # return symm_output, we don't need to check if input is symmetric
          if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
@@ -1862,7 +1811,7 @@
 +    """All-reduce the input tensor across model parallel group.
 +
 +    Routed through a breakable-cudagraph functional eager break: fast
-+    all-reduce paths (tbv_ar2) refuse to run during stream capture,
++    all-reduce paths (odl_ar2) refuse to run during stream capture,
 +    so capturing this op would bake the slow RCCL fallback into every graph
 +    replay. The break keeps the collective on the eager fast path at replay.
 +    The import is lazy to avoid a circular import at package init.
@@ -2154,12 +2103,12 @@
 +
 +    Unlike :func:`eager_break_during_capture`, the wrapped op may return a
 +    fresh tensor. At capture time the op runs eagerly (capture suspended, so
-+    capture-refusing fast paths like tbv_ar2 are usable) and its returned
++    capture-refusing fast paths like odl_ar2 are usable) and its returned
 +    tensor is pinned as the static output whose address downstream graph
 +    segments bake. On replay the op runs eagerly again and the fresh result
 +    is copied into the pinned tensor.
 +
-+    Motivation: collectives such as tbv_ar2 refuse to run during stream
++    Motivation: collectives such as odl_ar2 refuse to run during stream
 +    capture (torch.cuda.is_current_stream_capturing gate), so capturing them
 +    bakes the slow capture-safe RCCL fallback into every replay. Breaking
 +    them out keeps the fast eager path.

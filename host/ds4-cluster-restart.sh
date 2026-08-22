@@ -33,7 +33,7 @@ HEAD_IP=${DS4_HEAD_IP:?ds4-config.yaml: head_ip missing}
 WORKER_IP=${DS4_WORKER_IP:?ds4-config.yaml: worker_ip missing}
 PORT=${DS4_API_PORT:-1234}
 CTR=${DS4_CONTAINER:-vllm}
-TRANSPORT=${DS4_TRANSPORT:-rdma}
+TRANSPORT=${DS4_TRANSPORT:-odl}
 RAYTMP=$HOME/ray-tmp
 RAY_NUM_CPUS=${RAY_NUM_CPUS:-4}
 CENV=$HOME/ds4-cluster-env.$TRANSPORT.sh
@@ -144,8 +144,8 @@ echo "== verify =="
 journalctl --user -u "$UNIT.service" --no-pager -o cat --since "-20min" 2>/dev/null \
   | grep -aE "GPU KV cache size|Maximum concurrency" | tail -2 | sed 's/^/   /'
 rdma=$(journalctl --user -u "$UNIT.service" --no-pager -o cat --since "-20min" 2>/dev/null \
-  | grep -aoE "(tbv_ar2|odl_ar2): rank[0-9] ready[^\"]*" | head -1)
-echo "   fast AR: ${rdma:-!! tbv_ar2/odl_ar2 NOT ready -- decode all-reduce is on the slow path}"
+  | grep -aoE "odl_ar2: rank[0-9] ready[^\"]*" | head -1)
+echo "   fast AR: ${rdma:-!! odl_ar2 NOT ready -- decode all-reduce is on the slow path}"
 echo "   vllm serve procs: $(ps -eo cmd --no-headers | grep -c 'bin/[v]llm serve deepseek') (want 1)"
 echo "   ray idle workers: $(ps -eo cmd --no-headers | grep -c '[r]ay::IDLE')"
 echo "   MemAvailable: $(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo)MB"

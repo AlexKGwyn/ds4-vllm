@@ -1,9 +1,9 @@
 """odl_ar2.py — python wrapper for libodl_ar2.so (2-rank all-reduce over the
-OdinLink stream API; tbv_ar2's transport swapped from ibverbs to odl_tb5).
+OdinLink stream API).
 
-Same enqueue model as tbv_ar2: odl2_enqueue puts [stage copy] -> [doorbell] ->
+Enqueue model: odl2_enqueue puts [stage copy] -> [doorbell] ->
 [wait+add] on the current stream and returns; a CPU progress thread moves the
-data over /dev/odl_tb5_<idx>. Rendezvous roles are flipped vs tbv_ar2 (rank1
+data over /dev/odl_tb5_<idx>. Rendezvous roles: (rank1
 listens, rank0 connects out), so peer_ip must be rank1's reachable IP.
 """
 import ctypes
@@ -18,7 +18,7 @@ _LIB_PATHS = [
 ]
 
 RANK1_IP = os.environ.get("ODL2_RANK1_IP", "192.168.100.2")
-PORT = int(os.environ.get("ODL2_PORT", "18541"))  # distinct from tbv 18515/18531
+PORT = int(os.environ.get("ODL2_PORT", "18541"))
 DEV = int(os.environ.get("ODL2_DEV", "0"))
 
 _DTYPE = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}

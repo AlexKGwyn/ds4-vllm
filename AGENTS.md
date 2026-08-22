@@ -17,7 +17,7 @@ Strix Halo (gfx1151) boxes**, with the inter-GPU all-reduce carried over a
         │  ds4-vllm.service → ds4-cluster-restart.sh            │
         └───────────────┬───────────────────────────────────────┘
                         │  Thunderbolt-4 cable
-                        │  RoCE-RDMA dev = usb4_rdma*   (tbv stack)
+                        │  OdinLink RDMA  = /dev/odl_tb5_*
                         │  IP link thunderbolt0 = 192.168.100.1/.2
         ┌───────────────┴───────────────────────────────────────┐
         │  distrobox "vllm"  ──►  ray worker  TP rank 1          │
@@ -26,9 +26,10 @@ Strix Halo (gfx1151) boxes**, with the inter-GPU all-reduce carried over a
 
 Three independent layers, build/verify them in this order:
 
-1. **tbv RDMA** (`tbv/`) — the Thunderbolt interconnect. Foundational and the
-   riskiest; do it first. *(The cluster will also run without it on a slow TCP
-   fallback — see §1.5 to de-risk by validating vLLM first, then adding RDMA.)*
+1. **OdinLink fabric** (`odinlink/`) — the Thunderbolt interconnect.
+   Foundational and the riskiest; do it first. *(The cluster will also run
+   without it on a slow TCP fallback — see §1.2 to de-risk by validating vLLM
+   first, then adding the fabric.)*
 2. **vLLM engine** (`container/`) — rebuild the patched image, one distrobox per box.
 3. **Host orchestration** (`host/`) — the launch scripts, env, model weights.
 
@@ -36,15 +37,16 @@ Three independent layers, build/verify them in this order:
 
 - **2× AMD Strix Halo / gfx1151**, ~128 GB unified memory each, on the same LAN.
 - A **Thunderbolt-4 / USB4 cable** physically connecting the two boxes.
-- Linux with **kernel headers/devel** for the running kernel on each box, `podman`,
-  `distrobox`, `rdma-core`/`libibverbs`, `git`, build toolchain.
+- Linux with **kernel headers/devel** for the running kernel on each box,
+  `podman`, `distrobox`, `git`, build toolchain. A stock kernel is fine —
+  nothing here needs a patched thunderbolt core.
 - The model weights **`deepseek-ai/DeepSeek-V4-Flash-0731`** (~150 GB) downloaded
   on **both** boxes (`hf download deepseek-ai/DeepSeek-V4-Flash-0731`).
 - Root/sudo on both boxes (kernel modules, systemd units).
-- **Secure Boot disabled on both boxes** — the tbv modules are unsigned;
-  a Secure Boot kernel will refuse every `insmod` in §1. (The optional
-  OdinLink transport in §1.6 signs its driver with the host's enrolled MOK
-  at load time, but the §1 tbv core it depends on still needs this.)
+- **Secure Boot disabled on both boxes**, unless the box has an enrolled MOK:
+  `odl_tb5.ko` is built locally, and `odl-swap.sh` signs it with the enrolled
+  key when one is present. With no key and Secure Boot on, the kernel refuses
+  the `insmod` in §1.
 
 Pick roles now and keep them consistent everywhere: **box1 = ray head**, IP on
 Thunderbolt `192.168.100.1`; **box2 = worker**, `192.168.100.2`. Site values
@@ -70,116 +72,71 @@ needle/recall probes at your target context depth before it ships (see §5).
 
 ---
 
-## 1. tbv — Thunderbolt RDMA (do this first)
+## 1. OdinLink — the Thunderbolt fabric (do this first)
 
-Full detail in [`tbv/README.md`](tbv/README.md); this is the ordered action list.
-**The kernel modules are vermagic-locked to a specific kernel**,
-so plan to build for your exact kernel. Run every module step on **both**
-boxes.
+Full detail in [`odinlink/README.md`](odinlink/README.md); this is the ordered
+action list. Run every step on **both** boxes. The kernel driver is
+vermagic-locked to the running kernel, so rebuild it after a kernel update.
 
-### 1.1 Build the matched core+net (per box, per kernel)
+Requires **exactly one** Thunderbolt cable between the boxes — see "Why this
+builds on a stock kernel" in the OdinLink README for why that is a rule and not
+a preference.
 
-The `thunderbolt` core, `thunderbolt_net`, and `thunderbolt_ibverbs` must be one
-matched set or the box **panics on cable connect**.
+### 1.0 Migrating from the old tbv stack (skip on a fresh box)
 
-```bash
-tbv/build-modules.sh [KVER]          # all four modules, no sudo
-sudo tbv/install-modules.sh [KVER]   # stage /var/lib/tbv + blacklist + boot units
-```
-
-`build-modules.sh` fetches the pinned upstream trees (westeri @`503c5ae`;
-hellas-ai/thunderbolt-ibverbs @`76ba39b` + `tbv/ibverbs-local.patch`), applies
-the kernel patch series the ibverbs repo carries, and builds against the
-target kernel-devel. Gotchas it handles:
-- Force **`CONFIG_USB4_CONFIGFS=y`** in the KDIR `auto.conf` (else
-  `tb_configfs_init/exit` are undefined at link).
-- Build `thunderbolt_net` with **`KBUILD_EXTRA_SYMBOLS=<core>/Module.symvers`**
-  (it needs `tb_ring_throttling` from the patched core).
-- MODVERSIONS is off; only **vermagic** must match `uname -r`.
-
-### 1.2 Build the out-of-tree modules
-
-`build-modules.sh` above already builds ibverbs + nhi_throttle (steps 3-4)
-against the same patched KDIR; nothing separate to run.
-
-### 1.3 Install the userspace provider (host AND container)
+Earlier revisions of this repo ran the fabric on a patched thunderbolt core
+plus `thunderbolt_ibverbs`, with the stock driver blacklisted. None of that is
+needed now. If a box was ever set up that way:
 
 ```bash
-# The serving container image builds and ships the provider itself
-# (container/Dockerfile provider-build stage) — nothing to install for serving.
-# For host-side diagnostics (ibv_devices on the host), build the same way:
-# rdma-core v57.0 + the provider patches from the upstream ibverbs repo.
+sudo odinlink/uninstall-tbv.sh           # dry run — prints what it would change
+sudo odinlink/uninstall-tbv.sh --apply   # then REBOOT this box
 ```
-The provider matches devices **by name**, which is why the device must be
-renamed to `usb4_rdma*`.
 
-### 1.4 Stage, load, and bring up — COORDINATED
+This matters most for the `blacklist=thunderbolt` kernel arguments: with tbv's
+modules gone and the blacklist still in place, **no** thunderbolt driver loads
+at all and the boxes have no link — a failure that shows up a long way from its
+cause.
 
-- `sudo tbv/install-modules.sh` (on each box) does the whole install: stages
-  the built modules into `/var/lib/tbv`, blacklists the stock thunderbolt
-  driver (modprobe.d + kernel args, which also keeps the initramfs copy from
-  shadowing it), installs and enables `tbv-thunderbolt-patched.service`
-  (loads matched core+net at boot) and `tbv-roce.service` (the RoCE bring-up:
-  loads ibverbs with `roce_netdev=thunderbolt0`, renames the rail to
-  `usb4_rdma0`, populates the GID table, sets the 8 µs NHI throttle).
-- Ensure `thunderbolt0` autoconnects to its `192.168.100.x` IP at boot **before**
-  ibverbs claims the DMA rings — `install-modules.sh` prints the `nmcli`
-  command that writes the autoconnect NetworkManager profile.
-- **Then reboot BOTH boxes ~together.** The handshake only converges when both
-  come up in the right order simultaneously.
-
-> 🛑 **Do NOT** live-reload the core, and **do NOT** stagger per-box ibverbs
-> reloads. Both wedge the Thunderbolt HopID/tunnel allocator and require a
-> **coordinated reboot of both boxes** to recover. Live-swapping only
-> `thunderbolt_net` is the one safe hot operation.
-
-### 1.5 Verify RDMA (gate)
+### 1.1 Build and install (per box, per kernel)
 
 ```bash
-ls /sys/class/infiniband/                 # -> usb4_rdma0 (or usb4_rdma5)
-rdma link                                 # port state ACTIVE / PHYS_STATE LinkUp
-cat /sys/class/infiniband/usb4_rdma0/ports/1/gids/1   # NON-zero (RoCEv2 IPv4 GID = index 1)
-ibv_devices                               # lists usb4_rdma0
+odinlink/build-odinlink.sh             # odl_tb5.ko + libodl_tb5, no sudo
+sudo odinlink/install-odinlink.sh      # stage /usr/local + enable odinlink.service
+sudo systemctl start odinlink.service  # or reboot
 ```
-If `gids/1` is all-zero, `thunderbolt0` has no `192.168.100.x` IP yet — fix the IP
-first. If `usb4_rdma*` never appears after a kernel change, the `.ko` vermagic no
-longer matches: rebuild (§1.1–1.2) and `sudo systemctl restart tbv-roce.service`
-on both boxes.
 
-**De-risk option:** RDMA is a performance layer, not a correctness gate — set
-`transport: tcp` in `~/ds4-config.yaml` to run the same cluster over sockets
-(much slower decode). If you want to validate the model path first, skip to
-§2–§4 on TCP now and return to finish RDMA once tokens are flowing.
+`build-odinlink.sh` fetches OdinLink at its pin, applies
+`odinlink/odinlink-local.patch`, and builds against
+`/lib/modules/$(uname -r)/build` — stock headers, no out-of-tree thunderbolt
+core, no blacklist, no kernel arguments. Secure Boot must be off unless the box
+has an enrolled MOK, in which case `odl-swap.sh` signs the module with it.
 
-### 1.6 OPTIONAL — OdinLink transport (`transport: odl`)
+The RCCL net plugin and the `odl_ar2` decode all-reduce ship inside the §2
+image; the kernel driver is the only host build.
 
-An alternative Thunderbolt fabric ([`odinlink/`](odinlink/README.md)):
-RCCL over the OdinLink net plugin + the `odl_ar2` decode all-reduce, in
-place of the tbv ibverbs stack. It still needs §1.1 done first (the driver
-builds against the tbv-patched thunderbolt headers and runs on the patched
-core loaded by `tbv-thunderbolt-patched.service`); it replaces only
-`thunderbolt_ibverbs`. Requires **exactly one** Thunderbolt cable
-(`cables: 1`). The userspace (plugin + `odl_ar2`) ships inside the §2 image
-— the kernel driver is the only host build. Ordered steps, on **both**
-boxes:
+Load the driver **before** connecting the cable, and start both boxes promptly
+together.
+
+### 1.2 Verify the link (gate)
 
 ```bash
-odinlink/build-odinlink.sh            # odl_tb5.ko + libodl_tb5 (no sudo)
-sudo odinlink/install-odinlink.sh     # stage /usr/local, enable odinlink.service
-sudo systemctl disable --now tbv-roce.service   # Conflicts= makes these exclusive
-sudo systemctl start odinlink.service # or reboot; start both boxes promptly together
-/usr/local/bin/odl-state              # gate: dev0 state=ready
+odl-state                      # -> state=ready on BOTH boxes
+ip addr show thunderbolt0      # -> 192.168.100.x (or your configured pair)
 ```
 
-The service's load path (`odl-swap.sh`) signs `odl_tb5.ko` with the host's
-enrolled MOK when present (`/var/lib/shim-signed/mok/`), so it loads under
-Secure Boot. Then set `transport: odl` in `~/ds4-config.yaml` (plus
-`odl_rank1_ip`/`control_iface_*` if they differ from the defaults) and
-continue with §2–§4 unchanged; the §4 verify line reports
-`odl_ar2: rank0 ready`. Switch back with `transport: rdma`, re-enabling
-`tbv-roce.service`, and a coordinated reboot.
+`thunderbolt0` comes from mainline `thunderbolt_net` and carries the bootstrap
+sockets, Ray and ssh. If it has no address the cluster cannot come up whatever
+OdinLink reports, so fix that first.
 
----
+**Optional latency tweak:** `odinlink/nhi-throttle-mod/` lowers the NHI
+interrupt moderation the mainline driver hardcodes:
+`make -C odinlink/nhi-throttle-mod && sudo insmod odinlink/nhi-throttle-mod/nhi_throttle.ko ns=8000`.
+
+**De-risk option:** the fabric is a performance layer, not a correctness gate —
+set `transport: tcp` in `~/ds4-config.yaml` to run the same cluster over
+sockets (much slower decode). If you want to validate the model path first,
+skip to §2–§4 on TCP and come back.
 
 ## 2. Build the vLLM engine
 

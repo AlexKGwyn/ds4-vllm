@@ -1,7 +1,6 @@
 // odl_ar2.hip — 2-rank all-reduce over the OdinLink (odl_tb5) userspace API.
 //
-// Port of tbv_ar2.hip (ibverbs RC QPs) to OdinLink streams. The GPU side is
-// unchanged from tbv_ar2:
+// Shape of the collective:
 //
 //   stream:  [D2H copy into send slot] -> [doorbell kernel] -> [wait+add kernel]
 //   CPU:     progress thread polls the doorbell, moves bytes over OdinLink
@@ -9,7 +8,7 @@
 // The GPU wait+add kernel spins on a per-slot flag in pinned memory, then adds
 // the recv slot DIRECTLY (UMA zero-copy) — no H2D copy, no host wakeups.
 // dst = src + peer(src), elementwise SUM; dtype 0=bf16 1=fp16 2=fp32
-// (bf16/fp16 accumulate in fp32). Same semantics as tbv_ar2.
+// (bf16/fp16 accumulate in fp32).
 //
 // Transport = OdinLink streams in LATENCY mode, replacing the RC QP RDMA
 // writes:
@@ -35,19 +34,19 @@
 // order, and detect fragment loss. The dmabuf path blocks until TX complete
 // and re-attaches the dmabuf per call — worse for latency.
 //
-// Replaces tbv_ar2's flag-after-data RDMA-write ordering trick with stream
-// message ordering: a stream delivers complete messages in order, so message k
+// Ordering comes from the stream itself rather than a flag-after-data write:
+// a stream delivers complete messages in order, so message k
 // on the stream IS round k, and the flag store happens locally after the
 // message body has been copied into the slot.
 //
-// Slot-reuse safety (identical argument to tbv_ar2): the peer only sends round
+// Slot-reuse safety: the peer only sends round
 // N+2 after its wait_add(N+1) completed, which requires our N+1 arrived, which
 // (stream order on our side) requires our wait_add(N) finished reading recv
 // slot N — so an arriving message never overwrites a slot the GPU still reads.
 // Send slots are free for reuse as soon as stream_send returns (the ioctl
 // copies the payload into kernel DMA frames synchronously).
 //
-// Rendezvous: TCP barrier like tbv_ar2, but rank1 LISTENS and rank0 CONNECTS
+// Rendezvous: a TCP barrier in which rank1 LISTENS and rank0 CONNECTS
 // (rank0 may live inside a podman container without inbound port mapping;
 // outbound works everywhere).
 //
@@ -57,7 +56,7 @@
 //     -lodl_tb5 -lpthread
 //
 // Progress thread is adaptive: spins hot within 5ms of activity (decode
-// bursts), sleeps 200us otherwise — same policy as tbv_ar2 (rocm-idle-spin).
+// bursts), sleeps 200us otherwise (the rocm-idle-spin policy).
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
@@ -97,7 +96,7 @@ static uint64_t *recv_flag_dev;            /* device view                 */
 static uint64_t host_seq;                  /* caller-side round counter */
 static int inited;
 
-/* doorbell + error flags live in one small pinned block (as tbv_ar2) */
+/* doorbell + error flags live in one small pinned block */
 struct odl2_shared {
     uint64_t doorbell;      /* (seq << 24) | nbytes, GPU release-store  */
     int kernel_err;         /* wait+add timeout latch (GPU writes)      */
@@ -233,7 +232,7 @@ static void *progress_main(void *unused) {
         if (s > posted) {
             /* replay each seq in order with the latest nbytes (rounds are
              * same-shape within a decode step; a mismatch only over-sends
-             * within the slot, which is harmless) — same policy as tbv_ar2 */
+             * within the slot, which is harmless) */
             uint32_t nbytes = (uint32_t)(db & ODL2_DB_NBYTES_MASK);
             while (posted < s) {
                 posted++;
@@ -251,7 +250,7 @@ static void *progress_main(void *unused) {
 }
 
 /* ------------------------------------------------------------------ */
-/* GPU kernels — verbatim from tbv_ar2                                 */
+/* GPU kernels                                                        */
 /* ------------------------------------------------------------------ */
 __global__ void odl2_doorbell_kernel(uint64_t *db, uint64_t val) {
     if (threadIdx.x == 0)
@@ -308,7 +307,7 @@ extern "C" int odl2_init(int rank, int dev_index, const char *peer_ip, int port)
         perror("odl_ar2: fcntl O_NONBLOCK"); return -1;
     }
 
-    /* Pinned, GPU-visible staging — layout identical to tbv_ar2 */
+    /* Pinned, GPU-visible staging */
     if (hipHostMalloc((void**)&send_buf, ODL2_NSLOTS * ODL2_MAX_BYTES, hipHostMallocDefault) != hipSuccess)
         { fprintf(stderr, "odl_ar2: hipHostMalloc send failed\n"); return -1; }
     if (hipHostMalloc((void**)&recv_buf, ODL2_NSLOTS * ODL2_MAX_BYTES + 4096, hipHostMallocDefault) != hipSuccess)

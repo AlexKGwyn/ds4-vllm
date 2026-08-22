@@ -35,7 +35,7 @@ udevadm control --reload
 # Secure Boot rejects an unsigned out-of-tree module. Reuse the host's
 # already-enrolled DKMS/MOK key when present; each host signs its own artifact.
 # See "Secure Boot" in the repo README -- with no enrolled key this is a no-op
-# and Secure Boot must be disabled, exactly as for the tbv modules.
+# and Secure Boot must be disabled.
 SIGN_FILE="/lib/modules/$(uname -r)/build/scripts/sign-file"
 MOK_PRIV=${ODL_MOK_PRIV:-/var/lib/shim-signed/mok/MOK.priv}
 MOK_DER=${ODL_MOK_DER:-/var/lib/shim-signed/mok/MOK.der}

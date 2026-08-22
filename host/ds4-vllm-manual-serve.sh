@@ -23,7 +23,7 @@
 # a '#' there silently comments out every remaining argument, and `bash -n`
 # still reports the file as valid.
 set -u
-source "$HOME/ds4-cluster-env.${DS4_TRANSPORT:-rdma}.sh"
+source "$HOME/ds4-cluster-env.${DS4_TRANSPORT:-odl}.sh"
 
 # NVMe KV cache (fs_lru tier), ON by default. Prefix blocks evicted from GPU
 # are kept on node-local disk and reloaded instead of re-prefilled, and the
@@ -121,7 +121,7 @@ fi
 #      write only the valid rows of their in-place outputs, and NaN pool
 #      garbage in the padding rows otherwise poisons the whole batch
 #      through row-mixing fp8-quant reductions in the next graph segment.
-#   3. The TP all-reduce is a functional eager break: tbv_ar2 refuses to
+#   3. The TP all-reduce is a functional eager break: odl_ar2 refuses to
 #      run during stream capture, so capturing it would bake the RCCL
 #      fallback into every replay.
 # The capture sizes cover the MTP-5 decode shapes (6*num_seqs) exactly;

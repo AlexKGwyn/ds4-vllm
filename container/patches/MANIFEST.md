@@ -7,7 +7,7 @@ All changes are a single overlay on the **`kyuz0/vllm-therock-gfx1151`** base
   (`*.patch`, base → patched). The Dockerfile does **not** apply these; it
   `COPY`s the final files from `../rootfs`. The diffs are here for review so a
   reader can see exactly what changed versus upstream.
-- **17 new** files — added by the patch set; no diff (whole file is new). Their
+- **15 new** files — added by the patch set; no diff (whole file is new). Their
   final form is in `../rootfs`.
 - 1 file (`aiter_meta/csrc/cpp_itfs/utils.py`) was flagged changed by the image
   layer but is **byte-identical** to the base (metadata-only touch) and is
@@ -63,11 +63,9 @@ modules and the aiter config).
 ## Distributed all-reduce over Thunderbolt-4 RDMA
 | file | Δ | purpose |
 |---|---|---|
-| `vllm/distributed/device_communicators/cuda_communicator.py` | +74 | hook `DS4_TBV_AR` / `DS4_TBV_AR2` / `DS4_ODL_AR2` custom all-reduce |
+| `vllm/distributed/device_communicators/cuda_communicator.py` | +23 | hook the `DS4_ODL_AR2` custom decode all-reduce |
 | `vllm/distributed/communication_op.py` | +25/-2 | route `tensor_model_parallel_all_reduce` through a functional cudagraph eager break so graph replays keep the fast eager all-reduce instead of a baked RCCL fallback |
-| `tbv_ar.py` *(venv top-level)* | **new (255)** | v1 TB4-RDMA all-reduce (GPU dma-buf MRs) |
-| `tbv_ar2.py` *(venv top-level)* | **new (69)** | v2 GPU-poll + progress-thread all-reduce (~105 µs) |
-| `odl_ar2.py` *(venv top-level)* | **new (71)** | OdinLink GPU-poll + progress-thread decode all-reduce (ctypes wrapper for the in-image `libodl_ar2.so`). Inert unless `DS4_ODL_AR2=1` (set only by the `odl` transport profile) — the default tbv/rdma path is unchanged |
+| `odl_ar2.py` *(venv top-level)* | **new (71)** | OdinLink GPU-poll + progress-thread decode all-reduce (ctypes wrapper for the in-image `libodl_ar2.so`). Inert unless `DS4_ODL_AR2=1`, which the `odl` transport profile sets |
 
 ## Scheduler / KV / cudagraph / MTP
 | file | Δ | purpose |

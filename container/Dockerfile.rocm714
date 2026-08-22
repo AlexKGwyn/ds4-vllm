@@ -36,26 +36,11 @@ RUN /opt/venv/bin/pip uninstall -y \
       "torchaudio==2.11.0.2+rocm7.14.0"
 # (triton unpinned: stable torch pins triton==3.8.0+git4cff872c.rocm7.14.0)
 
-# 1b) Re-apply the rootfs overlay: the 20260815 parent image predates
-#     odl_ar2.py landing in rootfs/ (it was live-patched into the old
-#     containers); this bakes the current overlay in. NOTE the DS4_ODL_AR2
-#     branch of cuda_communicator.py is still a live-only container patch,
-#     not in the repo -- re-apply it after any container recreate.
+# 1b) Re-apply the rootfs overlay. The wheel swap above reinstalls into the
+#     same tree, so re-copying here keeps the overlay authoritative.
 COPY --chown=root:root container/rootfs/ /
 
-# 2) Recompile the TB4-RDMA all-reduce natives with the stable hipcc so the
-#    HIP runtime they link matches the wheels now in the venv.
-COPY --chown=root:root container/native/ /tmp/ds4-native/
-RUN dnf install -y rdma-core-devel && \
-    /opt/venv/bin/hipcc -O2 --offload-arch=gfx1151 -shared -fPIC \
-      -o /opt/venv/lib/python3.12/site-packages/libtbv_ar2.so \
-      /tmp/ds4-native/tbv_ar2.hip -libverbs -lpthread && \
-    gcc -O2 -shared -fPIC \
-      -o /opt/venv/lib/python3.12/site-packages/libtbv_ar.so \
-      /tmp/ds4-native/tbv_ar.c -libverbs && \
-    dnf clean all && rm -rf /tmp/ds4-native
-
-# 3) ABI-reuse smoke gate: torch must import and report the stable versions,
+# 2) ABI-reuse smoke gate: torch must import and report the stable versions,
 #    and the existing vLLM wheel must import against the stable torch.
 #    (No GPU inside the build; CPU-side import only.)
 RUN /opt/venv/bin/python - <<'EOF'
