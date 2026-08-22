@@ -1,0 +1,28 @@
+[Unit]
+Description=DeepSeek-V4-Flash vLLM TP=2 cluster (bring up both boxes)
+
+# OPTIONAL EXAMPLE -- the repo does not install this and nothing depends on it.
+# The stack is driven by host/ds4-serve.sh; if you also want systemd to own it,
+# this is a working unit to copy to ~/.config/systemd/user/ and adapt.
+#
+# Deliberately no [Install]: the model takes minutes to load and claims both
+# GPUs, so bringing it up at boot is a decision to make consciously. Add
+#     [Install]
+#     WantedBy=default.target
+# and `systemctl --user enable` if that is what you want, and enable lingering
+# (`loginctl enable-linger $USER`) so the user manager starts without a login.
+# If you do, note that the bring-up drives the worker box over ssh and will race
+# a box that has not finished booting -- gate it with an ExecStartPre that waits
+# for the worker to answer.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=45min
+TimeoutStopSec=5min
+ExecStart=%h/ds4-serve.sh start
+ExecStop=%h/ds4-serve.sh stop
+# ExecStop does not run when ExecStart itself fails; StopPost does, so a failed
+# bring-up still tears the cluster down instead of leaving ray daemons and a
+# stranded vllm serve behind. Idempotent.
+ExecStopPost=%h/ds4-serve.sh stop

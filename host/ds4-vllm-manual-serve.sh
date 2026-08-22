@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Production vLLM launcher (512K ctx + MTP, RDMA). Run INSIDE the vllm container;
-# started by the ds4-vllm-manual systemd user unit. Sources the canonical RDMA
+# started by ds4-cluster-restart.sh (ds4-serve.sh start). Sources the canonical
 # cluster-env, then execs vllm serve on api_port from ds4-config.yaml.
 #
 # THIS FILE IS THE SOURCE OF TRUTH -- copy it to the serve user's home before

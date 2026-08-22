@@ -14,7 +14,7 @@ Strix Halo (gfx1151) boxes**, with the inter-GPU all-reduce carried over a
 ```
         ┌────────────── box1 (ray HEAD, gfx1151) ──────────────┐
         │  distrobox "vllm"  ──►  vllm serve  TP rank 0         │
-        │  ds4-vllm.service → ds4-cluster-restart.sh            │
+        │  ds4-serve.sh start → ds4-cluster-restart.sh          │
         └───────────────┬───────────────────────────────────────┘
                         │  Thunderbolt-4 cable
                         │  OdinLink RDMA  = /dev/odl_tb5_*
@@ -173,14 +173,30 @@ rdma|tcp|odl`, RDMA HCA pin, disk KV). Two rules that bite:
 ## 4. Start serving
 
 ```bash
-systemctl --user start ds4-vllm      # box1; ~5 min warm
+./ds4-serve.sh start      # box1; ~5 min warm
+./ds4-serve.sh status     # API health, process counts, log path
+./ds4-serve.sh stop       # tears down both boxes
 ```
 
-`ds4-cluster-restart.sh` (the unit's ExecStart) does the whole sequence:
-teardown + stranded-process reap, container heal on both boxes, ray head +
-box2 worker (2 GPUs gate), then `vllm serve` via `ds4-vllm-manual-serve.sh`
-as the transient `ds4-vllm-manual` unit (MTP speculative decode,
-`deepseek_v4` tokenizer/reasoning/tool parsers, fp8 KV, eager, disk KV
-tier), verifies the API and the RDMA all-reduce, and dispatches the
-warmup (`ds4-vllm-warmup.py`, `warmup_ctx` in the yaml) before reporting
-success. `systemctl --user stop ds4-vllm` tears everything down.
+`ds4-serve.sh start` runs `ds4-cluster-restart.sh`, which does the whole
+sequence: teardown + stranded-process reap, container heal on both boxes, ray
+head + box2 worker (2 GPUs gate), then `vllm serve` via
+`ds4-vllm-manual-serve.sh` (MTP speculative decode, `deepseek_v4`
+tokenizer/reasoning/tool parsers, fp8 KV, disk KV tier), verifies the API and
+the fast all-reduce, and dispatches the warmup (`ds4-vllm-warmup.py`,
+`warmup_ctx` in the yaml) before reporting success.
+
+Supervision is a pid file and a log file, not systemd:
+
+```
+${XDG_RUNTIME_DIR:-/tmp}/ds4-vllm/serve.pid
+${XDG_STATE_HOME:-$HOME/.local/state}/ds4-vllm/serve.log   # ds4-serve.sh logs [-f]
+```
+
+The pid file holds the `podman exec` WRAPPER, not the `vllm serve` inside the
+container, so killing it alone strands the server holding the API port. That
+is why `stop` goes through the script: it reaps surviving `vllm serve`
+processes and refuses to bring the stack back up until none remain.
+
+Wiring this to systemd is left to you — `examples/systemd/ds4-vllm.service`
+is a working unit to copy and adapt if you want it.

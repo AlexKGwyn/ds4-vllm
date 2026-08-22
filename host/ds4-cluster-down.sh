@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
-# Full DS4 cluster teardown: serve unit -> stranded vllm serve procs -> ray on
+# Full DS4 cluster teardown: serve process -> stranded vllm serve procs -> ray on
 # both boxes. The stop half of ds4-cluster-restart.sh, for callers that need the
-# stack DOWN rather than restarted (mode flips, `systemctl --user stop
-# ds4-vllm`). Idempotent: every step is a no-op when its target is already gone.
+# stack DOWN rather than restarted. Idempotent: every step is a no-op when its
+# target is already gone.
 #
-# The explicit process reap exists because ds4-vllm-manual is a transient unit
-# supervising a `podman exec` wrapper, not the vllm serve inside the container:
-# stopping the unit alone strands the server, still holding the API port.
+# The explicit process reap exists because what the pid file tracks is a
+# `podman exec` wrapper, not the vllm serve inside the container: killing the
+# wrapper alone strands the server, still holding the API port.
 set -uo pipefail
 
 # Teardown must work even with a broken/missing config -- fall back to defaults.
 eval "$("$HOME/ds4-config" "$HOME/ds4-config.yaml" 2>/dev/null)" 2>/dev/null || true
 WORKER_IP=${DS4_WORKER_IP:-192.168.100.2}
 CTR=${DS4_CONTAINER:-vllm}
-UNIT=ds4-vllm-manual
+RUN_DIR=${DS4_RUN_DIR:-${XDG_RUNTIME_DIR:-/tmp}/ds4-vllm}
+PIDFILE=$RUN_DIR/serve.pid
 
-systemctl --user stop "$UNIT.service" 2>/dev/null
-systemctl --user reset-failed "$UNIT.service" 2>/dev/null
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")" 2>/dev/null
+fi
+rm -f "$PIDFILE"
 sleep 2
 
 # The bracket keeps this grep from matching its own command line.

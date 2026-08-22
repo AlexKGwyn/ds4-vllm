@@ -52,7 +52,7 @@ container/build.sh                                  # then create the distrobox 
 #    edit host/ds4-config.yaml (IPs, transport, memory) and deploy per §3
 
 # 4. launch (box1) — full 2-box bringup, OpenAI API on :1234 when done
-systemctl --user start ds4-vllm
+host/ds4-serve.sh start
 ```
 
 Full ordered runbook with the gates and gotchas: [`AGENTS.md`](AGENTS.md).
@@ -103,13 +103,14 @@ ds4vllm-public/
 │   ├── odinlink-local.patch, ar2/ ← our diff on the pin; odl_ar2 decode all-reduce
 ├── host/                         ← host-side orchestration (run outside the container)
 │   ├── ds4-config.yaml, ds4-config ← site config (IPs, transport, disk KV) + loader
-│   ├── ds4-cluster-restart.sh    ← full validated bringup (ExecStart of ds4-vllm.service)
-│   ├── ds4-cluster-down.sh       ← full teardown (ExecStop/StopPost)
+│   ├── ds4-serve.sh              ← start | stop | restart | status | logs (the entry point)
+│   ├── ds4-cluster-restart.sh    ← full validated bringup (what `start` runs)
+│   ├── ds4-cluster-down.sh       ← full teardown (what `stop` runs)
 │   ├── ds4-vllm-manual-serve.sh  ← the vllm serve invocation + all serving flags
 │   ├── ds4-vllm-warmup.py        ← post-start JIT/prefill-cache warmer (warmup_ctx)
 │   ├── ds4-cluster-env*.sh       ← canonical env + DS4_* tuning knobs (odl/tcp variants)
-│   ├── container-heal.sh         ← reconcile/start a wedged podman container
-│   └── systemd/                  ← ds4-vllm.service
+│   └── container-heal.sh         ← reconcile/start a wedged podman container
+├── examples/systemd/             ← OPTIONAL unit wrapping ds4-serve.sh (not installed)
 ```
 
 ---
@@ -227,16 +228,17 @@ the fabric or the model path.
 
 Deploy (paths are `$HOME`-relative, same layout on both boxes):
 
-- **box1**: `host/ds4-config{,.yaml}`, `ds4-cluster-restart.sh`,
-  `ds4-cluster-down.sh`, `ds4-vllm-manual-serve.sh`, `ds4-vllm-warmup.py`,
-  `container-heal.sh`, all four `ds4-cluster-env*.sh`, and
-  `host/systemd/ds4-vllm.service` into `~/.config/systemd/user/`.
+- **box1**: `host/ds4-config{,.yaml}`, `ds4-serve.sh`,
+  `ds4-cluster-restart.sh`, `ds4-cluster-down.sh`, `ds4-vllm-manual-serve.sh`,
+  `ds4-vllm-warmup.py`, `container-heal.sh`, and every `ds4-cluster-env*.sh`.
 - **box2**: `ds4-cluster-env*.sh` and `container-heal.sh` only — box2 is driven
   over ssh (key auth box1→box2 required).
 
-Then `systemctl --user start ds4-vllm` brings up the whole 2-box cluster
-(teardown → container heal → ray on both boxes → `vllm serve` → API/RDMA
-verify); `stop` tears it down. The env files must stay **identical on both
+Then `./ds4-serve.sh start` brings up the whole 2-box cluster (teardown →
+container heal → ray on both boxes → `vllm serve` → API/all-reduce verify);
+`stop` tears it down and `status` reports on it. There is no systemd here on
+purpose — `examples/systemd/ds4-vllm.service` wraps the same script if you
+want a unit. The env files must stay **identical on both
 boxes** — the two TP ranks silently diverge otherwise. 
 
 ---

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # OdinLink-transport env for the DS4 vLLM cluster (`transport: odl` in
 # ds4-config.yaml). Runs the 2-box cluster with RCCL's net plugin backed by
-# the odl_tb5 kernel driver (/dev/odl_tb5_*) instead of the usb4_rdma ibverbs
-# HCA. IB is disabled; the decode all-reduce goes
+# the odl_tb5 kernel driver (/dev/odl_tb5_*). IB is disabled; the decode
+# all-reduce goes
 # through odl_ar2 and every other collective through the plugin. Bring the
 # link up first: odinlink/README.md.
 source "$HOME/ds4-cluster-env.sh"

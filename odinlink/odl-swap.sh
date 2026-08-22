@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Swap thunderbolt_ibverbs -> odl_tb5 (real link mode) on THIS box.
+# Load odl_tb5 (real link mode) on THIS box, unloading a stale
+# thunderbolt_ibverbs first if an older tbv deployment left one behind.
 # Run with sudo on box1, then on box2 (any order, promptly after each other).
 # Usage: odl-swap.sh [ring=4096] [e2e=1] [busy_poll_us=0] [rx_poll_ns=3000]
 set -e
