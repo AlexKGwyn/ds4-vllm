@@ -46,6 +46,27 @@ index 62617b8..668141a 100644
  		goto out_reset;
  	}
  
+diff --git a/driver/odl_tb5_ring_dma.c b/driver/odl_tb5_ring_dma.c
+index 61b251f..fec92c8 100644
+--- a/driver/odl_tb5_ring_dma.c
++++ b/driver/odl_tb5_ring_dma.c
+@@ -399,6 +399,16 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+ 									    stream->rx_asm_len,
+ 									    stream->rx_asm_cap,
+ 									    stream->rx_asm_buf);
++							/* The message now has a hole in it. Mark it bad so
++							 * MSG_END discards it instead of delivering a
++							 * silently truncated buffer: to the caller a short
++							 * payload is not a lost message, it is wrong data
++							 * that looks valid. RCCL then sees a transport
++							 * error rather than a corrupted collective, which
++							 * is the difference between a visible failure and
++							 * a model that answers a question nobody asked. */
++							stream->rx_asm_bad = true;
++							atomic_inc(&stream->rx_frag_drops);
+ 						}
+ 
+ 						/* End of message — enqueue complete msg */
 diff --git a/rccl/src/odl_tb5_plugin.c b/rccl/src/odl_tb5_plugin.c
 index 1a8ab25..f6d02ae 100644
 --- a/rccl/src/odl_tb5_plugin.c

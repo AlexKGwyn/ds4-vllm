@@ -46,14 +46,27 @@ arguments, which otherwise leave the box with no thunderbolt driver at all.
   `ODL_MOK_PRIV`/`ODL_MOK_DER`), unloads any stale `thunderbolt_ibverbs`,
   loads `odl_tb5`, and waits for READY. With no
   enrolled key the signing step is a no-op and Secure Boot must be disabled.
-- `odinlink-local.patch` — three bug fixes on the pinned upstream, and
-  nothing else. Connection restart after a failed DMA verify (without it the
-  link parks in CONNECTED and wedges until a module reload);
+- `odinlink-local.patch` — four bug fixes on the pinned upstream, and nothing
+  else. Connection restart after a failed DMA verify (without it the link
+  parks in CONNECTED and wedges until a module reload);
   verify-survives-peer-relogin (both ends restarting otherwise phase-lock and
-  never converge); and the RCCL plugin's logger-ABI segfault, where a 2-arg
-  call into a 6-arg `ncclDebugLogger_t` made RCCL dereference the device count
-  as a filename. No tuning and no topology workarounds: every module parameter
-  except ring size is left at the driver default.
+  never converge); the RCCL plugin's logger-ABI segfault, where a 2-arg call
+  into a 6-arg `ncclDebugLogger_t` made RCCL dereference the device count as a
+  filename; and — the important one — marking a reassembly buffer bad when a
+  fragment is dropped.
+
+  That last one is worth understanding before running this on a memory-tight
+  box. A collective larger than the 512 KB assembly cap makes the driver grow
+  the buffer with `kmalloc(GFP_ATOMIC)`. On a unified-memory host, where the
+  model weights and KV pool come out of system RAM, that order-8 atomic
+  allocation can fail; upstream then drops the fragment but does NOT set
+  `rx_asm_bad`, so at `MSG_END` the message is delivered as complete and merely
+  short. The all-reduce returns data that looks valid and is not, and the model
+  answers questions nobody asked. The fix discards the message instead, so RCCL
+  sees a transport error rather than a corrupted collective.
+
+  No tuning and no topology workarounds: every module parameter except ring
+  size is left at the driver default.
 - `ar2/` — `odl_ar2`: the decode all-reduce carried over OdinLink
   streams (HIP + ctypes wrapper). Wired into the engine by `DS4_ODL_AR2=1`
   (branch carried in `container/patches/vllm-upstream.patch`, wrapper in
