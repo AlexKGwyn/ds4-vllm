@@ -46,24 +46,33 @@ arguments, which otherwise leave the box with no thunderbolt driver at all.
   `ODL_MOK_PRIV`/`ODL_MOK_DER`), unloads any stale `thunderbolt_ibverbs`,
   loads `odl_tb5`, and waits for READY. With no
   enrolled key the signing step is a no-op and Secure Boot must be disabled.
-- `odinlink-local.patch` — four bug fixes on the pinned upstream, and nothing
+- `odinlink-local.patch` — five bug fixes on the pinned upstream, and nothing
   else. Connection restart after a failed DMA verify (without it the link
   parks in CONNECTED and wedges until a module reload);
   verify-survives-peer-relogin (both ends restarting otherwise phase-lock and
   never converge); the RCCL plugin's logger-ABI segfault, where a 2-arg call
   into a 6-arg `ncclDebugLogger_t` made RCCL dereference the device count as a
-  filename; and — the important one — marking a reassembly buffer bad when a
-  fragment is dropped.
+  filename; marking a reassembly buffer bad when a fragment is dropped; and
+  preallocating the RX assembly buffers so that drop path stops firing at all.
 
-  That last one is worth understanding before running this on a memory-tight
-  box. A collective larger than the 512 KB assembly cap makes the driver grow
-  the buffer with `kmalloc(GFP_ATOMIC)`. On a unified-memory host, where the
-  model weights and KV pool come out of system RAM, that order-8 atomic
-  allocation can fail; upstream then drops the fragment but does NOT set
-  `rx_asm_bad`, so at `MSG_END` the message is delivered as complete and merely
-  short. The all-reduce returns data that looks valid and is not, and the model
-  answers questions nobody asked. The fix discards the message instead, so RCCL
-  sees a transport error rather than a corrupted collective.
+  The last two are worth understanding before running this on a memory-tight
+  box. Upstream grows the RX assembly buffer from the RX callback with
+  `kmalloc(GFP_ATOMIC)` — for a ~1 MiB collective an order-8 request that can
+  neither reclaim nor compact, so on a unified-memory host (model weights and
+  KV pool in system RAM) it fails even with gigabytes free. Upstream then
+  drops the fragment but does NOT set `rx_asm_bad`, so at `MSG_END` the
+  message is delivered as complete and merely short: the all-reduce returns
+  data that looks valid and is not, and the model answers questions nobody
+  asked. The `rx_asm_bad` fix discards the message instead, so RCCL sees a
+  transport error rather than a corrupted collective — but a dropped RCCL
+  payload is a collective that never completes, which surfaces as the engine
+  hanging in a collective with one worker spinning. The preallocation fix
+  removes the failure: each stream's assembly buffer (`rx_asm_max`, default
+  2 MiB) and a small pool of spares (`rx_asm_pool`, default 4) are allocated
+  at stream creation, where the allocator may sleep and compact; `MSG_END`
+  hands the filled buffer to the reader and takes a replacement from the
+  pool, and a dry pool falls back to an exact-size copy rather than the old
+  doubling growth.
 
   No tuning and no topology workarounds: every module parameter except ring
   size is left at the driver default.

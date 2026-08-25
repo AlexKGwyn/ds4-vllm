@@ -35,6 +35,14 @@ git apply --check "$HERE/odinlink-local.patch"
 git apply "$HERE/odinlink-local.patch"
 
 make -C driver
+# Proof the local patch reached the binary, not merely the tree: rx_asm_max is
+# a module parameter that exists only in the patched driver. Without this, a
+# build that somehow skipped the patch is indistinguishable from a good one at
+# the .ko level.
+modinfo -F parm driver/odl_tb5.ko | grep -q "^rx_asm_max" || {
+    echo "!! built odl_tb5.ko has no rx_asm_max parameter -- odinlink-local.patch did not apply" >&2
+    exit 1
+}
 echo "driver: $(modinfo -F vermagic driver/odl_tb5.ko)"
 
 # Userspace libodl_tb5: five plain-C files over the driver's uapi -- no ROCm,
