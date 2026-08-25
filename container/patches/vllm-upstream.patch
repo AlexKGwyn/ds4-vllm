@@ -1956,6 +1956,150 @@
  def tensor_model_parallel_all_gather(
      input_: torch.Tensor, dim: int = -1
  ) -> torch.Tensor:
+--- a/opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/shm_broadcast.py
++++ b/opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/shm_broadcast.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import functools
++import os
+ import pickle
+ import sys
+ import threading
+@@ -360,9 +361,19 @@
+     local_notify_addr: str | None = None
+     remote_subscribe_addr: str | None = None
+     remote_addr_ipv6: bool = False
++    # DS4_ODL_MQ: writer-side odl_tb5 hello stream id (None = zmq data
++    # plane). A cross-box reader answers with its own kernel-assigned stream
++    # id over odl before subscribing; the zmq socket above still carries the
++    # subscribe/READY handshake either way.
++    odl_mq_hello: int | None = None
+ 
+ 
+ class MessageQueue:
++    # DS4_ODL_MQ remote data plane (odl_mq.Writer / odl_mq.Reader). Class
++    # default covers every construction path incl. create_from_handle's
++    # __new__; only the remote writer/reader branches ever set it.
++    _odl_mq = None
++
+     def __init__(
+         self,
+         n_reader,  # number of all readers
+@@ -418,6 +429,7 @@
+             self._spin_condition = None  # type: ignore
+ 
+         remote_addr_ipv6 = False
++        remote_odl_dst = None
+         if n_remote_reader > 0:
+             # for remote readers, we will:
+             # create a publish-subscribe socket to communicate large data
+@@ -433,6 +445,25 @@
+             socket_addr = f"tcp://{connect_ip}:{remote_subscribe_port}"
+             self.remote_socket.bind(socket_addr)
+             remote_subscribe_addr = f"tcp://{connect_ip}:{remote_subscribe_port}"
++            # ds4: offer to carry the remote data plane over an odl_tb5
++            # stream instead of the zmq XPUB (the zmq socket stays for the
++            # subscribe/READY handshake). Single-remote-reader only. The
++            # reader accepts by helloing our stream (cross-box) or declines
++            # by staying silent (same-box / failure), settled in
++            # wait_until_ready; on any init failure (incl. no odl device on
++            # this host) the except below falls back to zmq, so this is safe
++            # unconditionally.
++            if n_remote_reader == 1:
++                try:
++                    import odl_mq
++                    self._odl_mq = odl_mq.Writer()
++                    remote_odl_dst = self._odl_mq.hello_sid
++                    logger.info(
++                        "odl_mq: writer offered (hello stream %d)", remote_odl_dst
++                    )
++                except Exception as e:
++                    logger.warning("odl_mq writer init failed, using zmq: %s", e)
++                    self._odl_mq = None
+         else:
+             remote_subscribe_addr = None
+             self.remote_socket = None
+@@ -450,6 +481,7 @@
+             local_notify_addr=local_notify_addr,
+             remote_subscribe_addr=remote_subscribe_addr,
+             remote_addr_ipv6=remote_addr_ipv6,
++            odl_mq_hello=remote_odl_dst,
+         )
+ 
+         logger.debug("vLLM message queue communication handle: %s", self.handle)
+@@ -493,6 +525,27 @@
+ 
+             self.local_socket = None
+ 
++            # DS4_ODL_MQ: accept the writer's odl offer only when the writer
++            # is on the OTHER box (odl streams cross the link; a same-box
++            # "remote" reader like the engine reading TP0's response queue
++            # must stay on zmq). Open + hello BEFORE the zmq subscribe: the
++            # writer gates its hello wait on our subscription arriving.
++            odl_hello = getattr(handle, "odl_mq_hello", None)
++            if odl_hello is not None:
++                import odl_mq
++                writer_ip = handle.remote_subscribe_addr.split("//")[1].rsplit(
++                    ":", 1)[0]
++                if odl_mq.is_local_ip(writer_ip):
++                    logger.info(
++                        "odl_mq: writer %s is same-host, staying on zmq", writer_ip
++                    )
++                else:
++                    self._odl_mq = odl_mq.Reader(odl_hello)
++                    logger.info(
++                        "odl_mq: reader up (stream %d -> hello %d)",
++                        self._odl_mq.sid, odl_hello,
++                    )
++
+             self.remote_socket = context.socket(SUB)
+             self.remote_socket.setsockopt_string(SUBSCRIBE, "")
+             if handle.remote_addr_ipv6:
+@@ -525,6 +578,19 @@
+             for i in range(self.n_remote_reader):
+                 # wait for subscription messages from all remote readers
+                 self.remote_socket.recv()
++            # DS4_ODL_MQ: the reader hellos our odl stream BEFORE its zmq
++            # subscribe, so with the subscription in hand the hello is
++            # either already here (cross-box reader accepted) or never
++            # coming (same-box reader declined) — settle the data plane now.
++            if self._odl_mq is not None:
++                if self._odl_mq.wait_hello(3000):
++                    logger.info(
++                        "odl_mq: writer up (dst stream %d)", self._odl_mq.dst
++                    )
++                else:
++                    logger.info("odl_mq: reader declined, using zmq")
++                    self._odl_mq.close()
++                    self._odl_mq = None
+             if self.n_remote_reader > 0:
+                 # send a message to all remote readers
+                 # to make sure the publish channel is working
+@@ -767,7 +833,10 @@
+             self._spin_condition.notify()
+ 
+         if self.n_remote_reader > 0:
+-            self.remote_socket.send_multipart(all_buffers, copy=False)
++            if self._odl_mq is not None:
++                self._odl_mq.send_multipart(all_buffers)
++            else:
++                self.remote_socket.send_multipart(all_buffers, copy=False)
+ 
+     def dequeue(
+         self,
+@@ -791,7 +860,10 @@
+             if overflow:
+                 obj = MessageQueue.recv(self.local_socket, timeout)
+         elif self._is_remote_reader:
+-            obj = MessageQueue.recv(self.remote_socket, timeout)
++            if self._odl_mq is not None:
++                obj = self._odl_mq.recv(timeout)
++            else:
++                obj = MessageQueue.recv(self.remote_socket, timeout)
+         else:
+             raise RuntimeError("Only readers can dequeue")
+         return obj
 --- a/opt/venv/lib/python3.12/site-packages/vllm/v1/core/kv_cache_utils.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/v1/core/kv_cache_utils.py
 @@ -1143,6 +1143,24 @@

@@ -3,12 +3,11 @@
 All changes are a single overlay on the **`kyuz0/vllm-therock-gfx1151`** base
 (pinned digest `sha256:25fd294f…`, which ships vLLM commit **`470229c`**).
 
-- **36 modified** files — shipped as `vllm-upstream.patch` in this folder, applied to the base's own sources at image build
-  (`*.patch`, base → patched). The Dockerfile does **not** apply these; it
-  `COPY`s the final files from `../rootfs`. The diffs are here for review so a
-  reader can see exactly what changed versus upstream.
-- **15 new** files — added by the patch set; no diff (whole file is new). Their
-  final form is in `../rootfs`.
+- **37 modified** files — shipped as `vllm-upstream.patch` in this folder, applied
+  to the base's own sources at image build (base → patched). The diffs double as
+  review material: a reader can see exactly what changed versus upstream.
+- **16 new** files — added by the patch set; no diff (whole file is new). Their
+  final form is in `../rootfs`, which the Dockerfile overlays after patching.
 - 1 file (`aiter_meta/csrc/cpp_itfs/utils.py`) was flagged changed by the image
   layer but is **byte-identical** to the base (metadata-only touch) and is
   deliberately **excluded**.
@@ -60,12 +59,14 @@ modules and the aiter config).
 | `ds4_fused_glue.py` *(venv top-level)* | **new (464)** | fused decode-glue triton kernels, all bit-exact vs the aten chains they replace: silu+mul+clamp, indexer paged-cache gather+dequant+pad, decode topk ragged build, and the DSpark drafter rope/fp8-QAT/concat/ring-scatter chains. Gated per call site (`DS4_FUSE_*` / `DS4_MTP_FUSE_GLUE`, default ON) |
 | `ds4-tunableop0.csv` *(venv top-level)* | **new (15)** | tuned hipblaslt algo picks for the attn_o `wo_b` decode GEMM (bf16 TN 4096×n×4096); read by torch TunableOp via the `PYTORCH_TUNABLEOP_*` env in `host/ds4-cluster-env.sh` (tuning off, read-only; shapes absent from the CSV keep the stock heuristic) |
 
-## Distributed all-reduce over Thunderbolt-4 RDMA
+## Distributed all-reduce + control plane over OdinLink
 | file | Δ | purpose |
 |---|---|---|
 | `vllm/distributed/device_communicators/cuda_communicator.py` | +23 | hook the `DS4_ODL_AR2` custom decode all-reduce |
 | `vllm/distributed/communication_op.py` | +25/-2 | route `tensor_model_parallel_all_reduce` through a functional cudagraph eager break so graph replays keep the fast eager all-reduce instead of a baked RCCL fallback |
 | `odl_ar2.py` *(venv top-level)* | **new (71)** | OdinLink GPU-poll + progress-thread decode all-reduce (ctypes wrapper for the in-image `libodl_ar2.so`). Inert unless `DS4_ODL_AR2=1`, which the `odl` transport profile sets |
+| `vllm/distributed/device_communicators/shm_broadcast.py` | +74/-2 | offer the `odl_mq` stream data plane to `MessageQueue`'s single cross-box reader: the writer advertises a hello stream in the Handle, the reader accepts only when the writer is on another host (UDP-bind locality test), and any init failure falls back to the stock zmq path — so the offer needs no env gate |
+| `odl_mq.py` *(venv top-level)* | **new (251)** | MessageQueue remote data plane over odl_tb5 streams: EngineCore→worker broadcast and the worker response queue ride OdinLink instead of zmq-over-thunderbolt-net TCP, removing the per-step TCP round trips. zmq keeps the subscribe/READY handshake; rendezvous via kernel-auto stream ids + a hello frame |
 
 ## Scheduler / KV / cudagraph / MTP
 | file | Δ | purpose |
