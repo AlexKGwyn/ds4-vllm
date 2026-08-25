@@ -57,7 +57,7 @@ modules and the aiter config).
 | `vllm/__init__.py` | +12 | import hook for the `DS4_FAST_TRITON` cached Triton launcher |
 | `ds4_fast_triton.py` *(venv top-level)* | **new (217)** | per-callsite cached fast path for `JITFunction.run`: caches the compiled kernel + grid per specialization key and relaunches via `CompiledKernel.run`, skipping the binder/specialization Python. The key strictly refines triton's own specialization inputs, so a hit can never select a different kernel. `DS4_FAST_TRITON=1` enables |
 | `vllm/model_executor/layers/activation.py` | +29 | `DS4_FUSE_SILU`: `SiluAndMulWithClamp` clamp/clamp/silu/mul as one triton kernel (bit-exact, per-op rounding preserved) |
-| `ds4_fused_glue.py` *(venv top-level)* | **new (455)** | fused decode-glue triton kernels, all bit-exact vs the aten chains they replace: silu+mul+clamp, indexer paged-cache gather+dequant+pad, decode topk ragged build, and the DSpark drafter rope/fp8-QAT/concat/ring-scatter chains. Gated per call site (`DS4_FUSE_*` / `DS4_MTP_FUSE_GLUE`, default ON) |
+| `ds4_fused_glue.py` *(venv top-level)* | **new (464)** | fused decode-glue triton kernels, all bit-exact vs the aten chains they replace: silu+mul+clamp, indexer paged-cache gather+dequant+pad, decode topk ragged build, and the DSpark drafter rope/fp8-QAT/concat/ring-scatter chains. Gated per call site (`DS4_FUSE_*` / `DS4_MTP_FUSE_GLUE`, default ON) |
 | `ds4-tunableop0.csv` *(venv top-level)* | **new (15)** | tuned hipblaslt algo picks for the attn_o `wo_b` decode GEMM (bf16 TN 4096×n×4096); read by torch TunableOp via the `PYTORCH_TUNABLEOP_*` env in `host/ds4-cluster-env.sh` (tuning off, read-only; shapes absent from the CSV keep the stock heuristic) |
 
 ## Distributed all-reduce over Thunderbolt-4 RDMA
