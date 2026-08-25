@@ -11,7 +11,68 @@
      from .xpu.mtp import DeepSeekV4MTP  # type: ignore[assignment]
 --- a/opt/venv/lib/python3.12/site-packages/vllm/models/deepseek_v4/amd/model.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/models/deepseek_v4/amd/model.py
-@@ -467,6 +467,21 @@
+@@ -311,7 +311,12 @@
+         hc_fn: torch.Tensor,
+         hc_scale: torch.Tensor,
+         hc_base: torch.Tensor,
++        norm_weight: torch.Tensor | None = None,
+     ):
++        # ds4 fused-norm wiring: norm_weight folds the following RMSNorm
++        # into the kernel's layer_input write (kernel support pre-existed,
++        # was never wired). None keeps the raw output for callers that still
++        # norm separately.
+         post_mix, res_mix, layer_input = self.mhc_pre(
+             residual=x,
+             fn=hc_fn,
+@@ -322,6 +327,8 @@
+             hc_sinkhorn_eps=self.hc_eps,
+             hc_post_mult_value=self.hc_post_alpha,
+             sinkhorn_repeat=self.hc_sinkhorn_iters,
++            norm_weight=norm_weight,
++            norm_eps=self.rms_norm_eps if norm_weight is not None else 0.0,
+         )
+         return layer_input, post_mix, res_mix
+ 
+@@ -347,7 +354,8 @@
+             # Run standalone hc_pre on first layer
+             residual = x
+             x, post_mix, res_mix = self.hc_pre(
+-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
++                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
++                norm_weight=self.attn_norm.weight,
+             )
+         else:
+             residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
+@@ -363,9 +371,13 @@
+                 self.hc_eps,
+                 self.hc_post_alpha,
+                 self.hc_sinkhorn_iters,
++                1,
++                1,
++                self.attn_norm.weight,
++                self.rms_norm_eps,
+             )
+ 
+-        x = self.attn_norm(x)
++        # attn_norm fused into the mhc kernel above (ds4 fused-norm wiring)
+         x = self.attn(positions, x, None)
+ 
+         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
+@@ -381,8 +393,12 @@
+             self.hc_eps,
+             self.hc_post_alpha,
+             self.hc_sinkhorn_iters,
++            1,
++            1,
++            self.ffn_norm.weight,
++            self.rms_norm_eps,
+         )
+-        x = self.ffn_norm(x)
++        # ffn_norm fused into the mhc kernel above (ds4 fused-norm wiring)
+         x = self.ffn(x, input_ids)
+         return x, residual, post_mix, res_mix
+ 
+@@ -467,6 +483,21 @@
              device=self.device,
          )
  
@@ -33,7 +94,7 @@
          if get_pp_group().is_first_rank:
              self.embed_tokens = VocabParallelEmbedding(
                  config.vocab_size,
-@@ -529,6 +544,24 @@
+@@ -529,6 +560,24 @@
              )
          else:
              self._mtp_hidden_buffer = None
@@ -58,7 +119,7 @@
  
      def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
          return self.embed_tokens(input_ids)
-@@ -571,7 +604,11 @@
+@@ -571,7 +620,11 @@
              hidden_states = intermediate_tensors["hidden_states"]
  
          residual, post_mix, res_mix = None, None, None
@@ -71,7 +132,7 @@
              hidden_states, residual, post_mix, res_mix = layer(
                  hidden_states,
                  positions,
-@@ -580,6 +617,29 @@
+@@ -580,6 +633,29 @@
                  res_mix,
                  residual,
              )
@@ -101,7 +162,7 @@
          if layer is not None and self.has_tilelang:
              hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
  
-@@ -589,6 +649,9 @@
+@@ -589,6 +665,9 @@
          # Stash pre-hc_head residual for the MTP draft (captured copy_).
          num_tokens = hidden_states.shape[0]
          self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
@@ -111,7 +172,7 @@
  
          hidden_states = self.hc_head_op(
              hidden_states,
-@@ -807,6 +870,9 @@
+@@ -807,6 +886,9 @@
          """Pre-hc_head residual stream buffer (max_num_batched_tokens,
          hc_mult * hidden_size) for the MTP draft model. Populated by
          forward(); valid after each target step."""

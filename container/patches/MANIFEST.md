@@ -21,7 +21,7 @@ modules and the aiter config).
 | file | Δ | purpose |
 |---|---|---|
 | `vllm/models/deepseek_v4/__init__.py` | +1/-1 | model registration |
-| `vllm/models/deepseek_v4/amd/model.py` | +67/-1 | AMD DSpark model wiring (custom all-reduce hook, layer glue) |
+| `vllm/models/deepseek_v4/amd/model.py` | +86/-4 | AMD DSpark model wiring (custom all-reduce hook, layer glue); folds the decode layer's `attn_norm`/`ffn_norm` RMSNorms into the mhc kernels' `layer_input` write (kernel support pre-existed, was never wired), dropping two standalone norm kernels per layer |
 | `vllm/models/deepseek_v4/amd/rocm.py` | +67 | ROCm-specific op paths; `DS4_FUSE_RAGGED` single-kernel decode topk ragged build |
 | `vllm/models/deepseek_v4/amd/dspark_mtp.py` | **new (1384)** | DSpark Multi-Token-Prediction (MTP) drafter: fast-replay contract, self-managed step-0 draft CUDA graphs (`DS4_MTP_CUDAGRAPH`), fused in-graph glue (`DS4_MTP_FUSE_GLUE`), vocab-sharded markov chain + distributed argmax (`DS4_MTP_VOCAB_SHARD`) |
 | `vllm/models/deepseek_v4/attention.py` | +32/-4 | MLA / sparse-attention wiring |
