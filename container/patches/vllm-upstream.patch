@@ -3273,7 +3273,7 @@
 +        "remains unchecked and no error remains undiscovered.\n\n"
 +    ),
 +}
-+DEFAULT_REASONING_EFFORT = "low"
++DEFAULT_REASONING_EFFORT = "high"
  
  TOOLS_TEMPLATE = """## Tools
  
