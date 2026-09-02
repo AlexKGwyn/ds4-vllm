@@ -2,14 +2,16 @@
 //
 //   C[M,N] = A[M,K](bf16) @ W[N,K](fp8 e4m3fn, 128x128 block scales fp32).T
 //
-// This kernel is entirely MEMORY-bound: with the dequant and every FMA deleted
-// it runs no faster. The win is therefore not in the math but in the DRAM
-// access footprint -- see the ksplit kernel below, where a workgroup walks a
-// CONTIGUOUS span of memory instead of touching 8-16 chunks a row-stride
-// apart. It beats the bf16 path, which reads twice the bytes.
+// v12: the decisive finding is that this kernel is 100% MEMORY-bound -- with
+// the dequant and every FMA deleted it runs the same speed (or slower). So the
+// win is not in the math, it is in the DRAM access footprint. See the ksplit
+// kernel below: a workgroup must walk a CONTIGUOUS span of memory, not touch
+// 8-16 chunks a row-stride apart. That alone took wo from 103 to 212 GB/s
+// (~92% of this box's ~226 GB/s practical peak) and made every dense decode
+// shape beat bf16-hipblaslt, which reads twice the bytes at ~200 GB/s.
 //
-// Retained from earlier revisions (all near-neutral once ksplit landed,
-// because the arithmetic they optimise was already free):
+// Retained from v10 (all measured neutral-to-tiny once ksplit landed, because
+// the arithmetic they optimize was already free):
 //   #1 A loaded as uint4 (2 loads per m per 512B tile, not 8 dwords)
 //   #3 K<=1024 "kfit" kernel: whole strip is 1-2 quads, all W front-loaded
 //   #4 packed dequant: v_perm_b32 spreads fp8 bytes into half-word slots and
@@ -72,6 +74,11 @@
 #endif
 
 typedef uint16_t bf16_t;
+typedef unsigned int u32x4_t __attribute__((ext_vector_type(4)));
+// W loads are NON-TEMPORAL (read-once weights stay out of L2/MALL): +2-4%
+// across the decode shapes (wo 204 -> 212 GB/s), results bitwise identical.
+__device__ __forceinline__ uint4 nt_load4(const uint4* p) { u32x4_t v = __builtin_nontemporal_load(reinterpret_cast<const u32x4_t*>(p)); return make_uint4(v.x, v.y, v.z, v.w); }
+
 
 __device__ __forceinline__ float bf16_hi(uint32_t pair) {
     return __uint_as_float(pair & 0xffff0000u);
@@ -171,7 +178,17 @@ __device__ __forceinline__ void load_a8(const bf16_t* src, uint32_t* dst) {
 }
 
 // ------------------------------------------------- kfit  (K <= 1024) ------
-template <int M>
+// R rows per wave, W quads loaded per quad inside the K loop. The 2-rows-per-
+// wave layout re-read the whole activation slice from L2 for 2 KB of weights
+// (at M=6, K=1024: 96 KB of L2 traffic per 16 KB of DRAM weights per
+// workgroup), which held the K=1024 shapes at 145-177 GB/s while wo (K=4096,
+// ksplit) reached 208. R=4 amortises each A quad over 4 rows. Measured
+// (bench_fp8_gemv_padded.py): 16384x1024 177 -> 198, 8192x1024 167 -> 189,
+// 4096x1024 145 -> 155 GB/s. Loading all R x nq W quads up front spills
+// (R=8: 272 B/lane scratch, 102 GB/s; R=4: 144 B, 137 GB/s) -- per-quad loads
+// keep it at 161 VGPRs, no scratch. Per-row math is unchanged (same lane->k
+// mapping, same fma order), so results are bitwise identical to before.
+template <int M, int R>
 __global__ void __launch_bounds__(256)
 fp8_gemv_kfit_kernel(const bf16_t* __restrict__ A,
                      const uint32_t* __restrict__ W,
@@ -179,42 +196,39 @@ fp8_gemv_kfit_kernel(const bf16_t* __restrict__ A,
                      bf16_t* __restrict__ C, int N, int K, int ldw4) {
     const int lane = threadIdx.x & 31;
     const int wave = threadIdx.x >> 5;
-    const int r0 = (blockIdx.x * 8 + wave) * 2;
+    const int r0 = (blockIdx.x * 8 + wave) * R;
     const int Kd4 = ldw4;
     const int Ksc = K >> 7;
     const int lane_b = lane * 16;
     const int kb_lane = lane_b >> 7;
     const int nq = K >> 9;  // 1 or 2
 
-    uint4 w4[2][2];
+    float acc[R][M];
 #pragma unroll
-    for (int rr = 0; rr < 2; ++rr) {
-        const uint32_t* wp = W + (r0 + rr) * Kd4 + (lane_b >> 2);
-        w4[rr][0] = *reinterpret_cast<const uint4*>(wp);
-        if (nq > 1) w4[rr][1] = *reinterpret_cast<const uint4*>(wp + 128);
-    }
-
-    float acc[2][M];
-#pragma unroll
-    for (int rr = 0; rr < 2; ++rr)
+    for (int rr = 0; rr < R; ++rr)
 #pragma unroll
         for (int m = 0; m < M; ++m) acc[rr][m] = 0.0f;
 
     for (int q = 0; q < nq; ++q) {
         const int kq = q << 9;
+        uint4 wq[R];
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr)
+            wq[rr] = nt_load4(reinterpret_cast<const uint4*>(
+                W + (r0 + rr) * Kd4 + ((kq + lane_b) >> 2)));
         uint32_t apairs[M * 8];
 #pragma unroll
         for (int m = 0; m < M; ++m)
             load_a8(A + m * K + kq + lane_b, apairs + m * 8);
         const int sc_col = (kq >> 7) + kb_lane;
 #pragma unroll
-        for (int rr = 0; rr < 2; ++rr)
-            fma16<M>(w4[rr][q], apairs,
+        for (int rr = 0; rr < R; ++rr)
+            fma16<M>(wq[rr], apairs,
                      WS[((r0 + rr) >> 7) * Ksc + sc_col] , acc[rr]);
     }
 
 #pragma unroll
-    for (int rr = 0; rr < 2; ++rr)
+    for (int rr = 0; rr < R; ++rr)
 #pragma unroll
         for (int m = 0; m < M; ++m) {
             float v = acc[rr][m];
@@ -253,8 +267,7 @@ fp8_gemv_big_kernel(const bf16_t* __restrict__ A,
     for (int p = 0; p < PF; ++p)
 #pragma unroll
         for (int rr = 0; rr < R; ++rr)
-            wbuf[p][rr] = *reinterpret_cast<const uint4*>(
-                W + (r0 + rr) * Kd4 + ((p * 512 + lane_b) >> 2));
+            wbuf[p][rr] = nt_load4(reinterpret_cast<const uint4*>(W + (r0 + rr) * Kd4 + ((p * 512 + lane_b) >> 2)));
 
     const int nq = K >> 9;
     for (int q = 0; q < nq; ++q) {
@@ -270,8 +283,7 @@ fp8_gemv_big_kernel(const bf16_t* __restrict__ A,
         if (kn < K) {
 #pragma unroll
             for (int rr = 0; rr < R; ++rr)
-                wbuf[PF - 1][rr] = *reinterpret_cast<const uint4*>(
-                    W + (r0 + rr) * Kd4 + ((kn + lane_b) >> 2));
+                wbuf[PF - 1][rr] = nt_load4(reinterpret_cast<const uint4*>(W + (r0 + rr) * Kd4 + ((kn + lane_b) >> 2)));
         }
 
         uint32_t apairs[M * 8];
@@ -298,9 +310,9 @@ fp8_gemv_big_kernel(const bf16_t* __restrict__ A,
 
 // ------------------------------------------------ ksplit (any K) ---------
 // The wave-per-rows layout gives a workgroup an instantaneous footprint of
-// 8-16 chunks one row-stride apart, which roughly halves DRAM efficiency at
-// K=4096 relative to K=1024, where rows are adjacent. Here a workgroup always
-// covers a CONTIGUOUS span of memory:
+// 8-16 chunks one row-stride apart, which halves DRAM efficiency at K=4096
+// (measured with compute removed: 79 GB/s vs 174 at K=1024, where rows are
+// adjacent). Here a workgroup always covers a CONTIGUOUS span of memory:
 // WPR = K/512 waves cover one row, RP = 8/WPR rows are in flight per pass,
 // and passes step to adjacent rows. A depends only on the k-slice, so each
 // wave loads its A slice once and reuses it for every row it touches.
@@ -342,15 +354,13 @@ fp8_gemv_ksplit_kernel(const bf16_t* __restrict__ A,
         for (int m = 0; m < M; ++m) acc[p][m] = 0.0f;
 
     // one pass in flight ahead; the next rows are adjacent memory
-    uint4 wnext = *reinterpret_cast<const uint4*>(
-        W + (r0 + rsub) * Kd4 + (lane_b >> 2));
+    uint4 wnext = nt_load4(reinterpret_cast<const uint4*>(W + (r0 + rsub) * Kd4 + (lane_b >> 2)));
 #pragma unroll
     for (int p = 0; p < PASSES; ++p) {
         const uint4 wcur = wnext;
         const int rr = p * RP + rsub;
         if (p + 1 < PASSES)
-            wnext = *reinterpret_cast<const uint4*>(
-                W + (r0 + rr + RP) * Kd4 + (lane_b >> 2));
+            wnext = nt_load4(reinterpret_cast<const uint4*>(W + (r0 + rr + RP) * Kd4 + (lane_b >> 2)));
         fma16<M>(wcur, apairs, WS[((r0 + rr) >> 7) * Ksc + sc_col], acc[p]);
     }
 
@@ -427,13 +437,22 @@ int ds4_fp8_gemv(const void* A, const void* W, const void* WS, void* C,
         default: KSPLIT_LAUNCH(m, 1, KS_ROWS_SM) break;                    \
     }
     dim3 gk(N / 16), gb(N / (8 * R)), block(256);
+    // kfit rows per wave: 4 while the grid still fills the GPU (>= 64 workgroups
+    // of 8 waves), else 2 for the narrow shapes.
+    const int kfit_r = (N % 32 == 0 && N / 32 >= 64) ? 4 : 2;
     hipStream_t s = (hipStream_t)stream;
 #define CASE(m)                                                            \
     case m:                                                                \
-        if (K <= 1024)                                                     \
-            hipLaunchKernelGGL((fp8_gemv_kfit_kernel<m>), gk, block, 0,    \
-                               s, (const bf16_t*)A, (const uint32_t*)W,    \
-                               (const float*)WS, (bf16_t*)C, N, K, ldw4);        \
+        if (K <= 1024) {                                                   \
+            if (kfit_r == 4)                                               \
+                hipLaunchKernelGGL((fp8_gemv_kfit_kernel<m, 4>), dim3(N / 32), block, 0, \
+                                   s, (const bf16_t*)A, (const uint32_t*)W, \
+                                   (const float*)WS, (bf16_t*)C, N, K, ldw4); \
+            else                                                           \
+                hipLaunchKernelGGL((fp8_gemv_kfit_kernel<m, 2>), gk, block, 0, \
+                                   s, (const bf16_t*)A, (const uint32_t*)W, \
+                                   (const float*)WS, (bf16_t*)C, N, K, ldw4); \
+        }                                                                  \
         else if (ksplit)                                                   \
             KSPLIT_DISPATCH(m)                                             \
         else if (R == 2)                                                   \

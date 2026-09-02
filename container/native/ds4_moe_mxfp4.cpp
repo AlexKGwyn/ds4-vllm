@@ -71,6 +71,18 @@
 // to cancel the advantage.
 
 typedef uint16_t bf16_t;
+typedef unsigned int u32x2_t __attribute__((ext_vector_type(2)));
+typedef unsigned int u32x4_t __attribute__((ext_vector_type(4)));
+// Weight loads are NON-TEMPORAL: every expert byte is read exactly once per
+// step, so keeping it out of L2/MALL is pure win -- measured 180 -> 193 GB/s on
+// the pair with no arithmetic change (bitwise identical results). A v_perm-LUT
+// e2m1->bf16 decode feeding v_dot2_f32_bf16 reached 201 GB/s but, served,
+// changed temp-0 outputs and cost 10% tok/s on the code probe through draft
+// acceptance (3.90 -> 3.45 tok/step) -- same lesson as WB=16; not taken.
+template <typename WT> __device__ __forceinline__ WT nt_load(const WT* p);
+template <> __device__ __forceinline__ uint2 nt_load<uint2>(const uint2* p) { u32x2_t v = __builtin_nontemporal_load(reinterpret_cast<const u32x2_t*>(p)); return make_uint2(v.x, v.y); }
+template <> __device__ __forceinline__ uint4 nt_load<uint4>(const uint4* p) { u32x4_t v = __builtin_nontemporal_load(reinterpret_cast<const u32x4_t*>(p)); return make_uint4(v.x, v.y, v.z, v.w); }
+
 
 __device__ __forceinline__ float bf16_lo(uint32_t p) { return __uint_as_float(p << 16); }
 __device__ __forceinline__ float bf16_hi(uint32_t p) { return __uint_as_float(p & 0xffff0000u); }
@@ -290,8 +302,8 @@ moe_gemm1_kernel(const bf16_t* __restrict__ x, const uint8_t* __restrict__ V,
     // rr < NR -> gate row n0+rr ; rr >= NR -> up row n0+I+(rr-NR)
 #define G1ROW(rr) ((rr) < NR ? (n0 + (rr)) : (n0 + I + (rr) - NR))
     using WT = typename WVec<WB>::T;
-#define G1LOAD(rr) (*reinterpret_cast<const WT*>(                              \
-    V + ebase + (size_t)G1ROW(rr) * Kb + byte_off))
+#define G1LOAD(rr) (nt_load<WT>(reinterpret_cast<const WT*>(                    \
+    V + ebase + (size_t)G1ROW(rr) * Kb + byte_off)))
     constexpr int PFD = PF < PASSES ? PF : PASSES;
     WT wbuf[PFD];
 #pragma unroll
@@ -402,8 +414,8 @@ moe_gemm2_kernel(const bf16_t* __restrict__ ic, const uint8_t* __restrict__ V,
 
     const int n0 = blockIdx.x * NR;
     using WT = typename WVec<WB>::T;
-#define G2LOAD(nn) (*reinterpret_cast<const WT*>(                              \
-    V + ebase + (size_t)(nn) * Kb + byte_off))
+#define G2LOAD(nn) (nt_load<WT>(reinterpret_cast<const WT*>(                    \
+    V + ebase + (size_t)(nn) * Kb + byte_off)))
     constexpr int PFD = PF < PASSES ? PF : PASSES;
     WT wbuf[PFD];
 #pragma unroll
