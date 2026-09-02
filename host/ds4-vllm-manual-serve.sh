@@ -130,6 +130,21 @@ fi
 # cannot be captured by the runner's wrapper (its replay-marker test is a
 # blocking D2H, illegal during capture) and manages its own step-0 graphs
 # instead (DS4_MTP_CUDAGRAPH, default on).
+SPEC_ARGS=()
+if (( ${DS4_SPEC_TOKENS:-5} > 0 )); then
+  if [ "${DS4_ASYNC_SCHED:-1}" = "1" ]; then
+    # Async scheduling (overlaps scheduler/output host work with the GPU
+    # step) requires PADDED drafter batches -- every sequence hands the
+    # drafter all num_spec+1 rows and the proposer names the last ACCEPTED
+    # row via token_indices_to_sample (the DSpark wrapper drafts at those
+    # anchors; set_anchor_indices). enforce_eager stays: the drafter's
+    # self-managed step-0 graphs remain the capture path.
+    # DS4_ASYNC_SCHED=0 restores the unpadded/sync configuration.
+    SPEC_ARGS=(--speculative-config "{\"method\":\"deepseek_mtp\",\"num_speculative_tokens\":${DS4_SPEC_TOKENS:-5},\"disable_padded_drafter_batch\":false,\"enforce_eager\":true}" --async-scheduling)
+  else
+    SPEC_ARGS=(--speculative-config "{\"method\":\"deepseek_mtp\",\"num_speculative_tokens\":${DS4_SPEC_TOKENS:-5},\"disable_padded_drafter_batch\":true,\"enforce_eager\":true}")
+  fi
+fi
 exec vllm serve "${DS4_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}" \
   --served-model-name deepseek-v4-flash \
   --tensor-parallel-size 2 \
@@ -148,6 +163,6 @@ exec vllm serve "${DS4_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}" \
   --override-generation-config '{"temperature":1.0,"top_p":1.0}' \
   --enable-auto-tool-choice \
   --tool-call-parser deepseek_v4 \
-  --speculative-config '{"method":"deepseek_mtp","num_speculative_tokens":5,"disable_padded_drafter_batch":true,"enforce_eager":true}' \
+  "${SPEC_ARGS[@]}" \
   "${OFFLOAD[@]}" \
   --host 127.0.0.1 --port "${DS4_API_PORT:-1234}"
