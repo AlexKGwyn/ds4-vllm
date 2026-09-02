@@ -49,6 +49,12 @@ RUN /opt/venv/bin/hipcc -O3 --offload-arch=gfx1151 -shared -fPIC \
     /opt/venv/bin/hipcc -O3 --offload-arch=gfx1151 -shared -fPIC \
       -o /opt/venv/lib/python3.12/site-packages/libds4fp8gemv.so \
       /tmp/ds4-native/ds4_fp8_gemv_hip.cpp && \
+    /opt/venv/bin/hipcc -O2 --offload-arch=gfx1151 -shared -fPIC \
+      -o /opt/venv/lib/python3.12/site-packages/libib_ar2.so \
+      /tmp/ds4-native/ib_ar2.hip -libverbs -lpthread && \
+    /opt/venv/bin/hipcc -O3 --offload-arch=gfx1151 -shared -fPIC \
+      -o /opt/venv/lib/python3.12/site-packages/libds4idx.so \
+      /tmp/ds4-native/ds4_idx_score.hip && \
     rm -rf /tmp/ds4-native
 
 # 3) ABI-reuse smoke gate: torch must import and report the stable versions,

@@ -1887,10 +1887,33 @@
          gate = torch.clamp(x[..., :d], max=self.swiglu_limit)
 --- a/opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/cuda_communicator.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/distributed/device_communicators/cuda_communicator.py
-@@ -252,6 +252,29 @@
+@@ -252,6 +252,52 @@
          )
  
      def all_reduce(self, input_):
++        # DS4_IB_AR2=1: tbv_ar2-class all-reduce over native InfiniBand
++        # (libib_ar2 / mlx4 ConnectX-3). Same 2-rank gating and eligibility as
++        # the branches below; decode-sized ops take this path, prefill's ~4 MiB
++        # all-reduces exceed IBAR2_MAX_BYTES=1MiB and go to RCCL-over-IB.
++        import os as _os4
++        if _os4.environ.get("DS4_IB_AR2") == "1" and not getattr(self, "_ibar2_failed", False):
++            _q4 = getattr(self, "_ib_ar2", None)
++            if _q4 is None:
++                try:
++                    import torch.distributed as _d4
++                    if _d4.get_world_size(group=self.device_group) == 2:
++                        from ib_ar2 import IbAllReduce2
++                        self._ib_ar2 = _q4 = IbAllReduce2(
++                            _d4.get_rank(group=self.device_group))
++                    else:
++                        self._ibar2_failed = True
++                except Exception as _e4:
++                    import logging
++                    logging.getLogger(__name__).warning("ib_ar2 init failed: %s", _e4)
++                    self._ibar2_failed = True
++            if _q4 is not None and _q4.eligible(input_):
++                _r4 = torch.empty_like(input_)
++                return _q4.all_reduce_out(input_, _r4)
 +        # DS4_ODL_AR2=1: 2-rank decode all-reduce over the OdinLink stream
 +        # API (libodl_ar2 / odl_tb5). Decode-sized ops take this path; larger
 +        # prefill all-reduces are ineligible and fall through to RCCL, which
@@ -2508,7 +2531,39 @@
      def propose(
          self,
          # [num_tokens]
-@@ -585,13 +616,32 @@
+@@ -480,6 +511,31 @@
+             )
+         )
+ 
++        # DS4: hand stash-style drafters (DSpark MTP) their draft anchors --
++        # token_indices_to_sample is where set_inputs_first_pass just wrote
++        # next_token_ids. Identical to the drafter's position-derived
++        # segment-end anchors in unpadded mode; the last ACCEPTED row (the
++        # true anchor) under padded drafter batches, where segment ends are
++        # usually REJECTED tokens. getattr-gated so every other drafter is
++        # untouched -- but under padded batches a stash drafter that does not
++        # expose the hook silently drafts from a rejected row (acceptance
++        # collapses to ~0 with no error), so say so once, loudly.
++        _ds4_set_anchors = getattr(self.model, "set_anchor_indices", None)
++        if _ds4_set_anchors is not None:
++            _ds4_set_anchors(token_indices_to_sample)
++        elif not getattr(self, "_ds4_anchor_warned", False):
++            self._ds4_anchor_warned = True
++            if not self.speculative_config.disable_padded_drafter_batch and getattr(
++                self.model, "dspark_replay_ignores_inputs", False
++            ):
++                logger.error(
++                    "DS4: padded drafter batches are ON but %s exposes no "
++                    "set_anchor_indices -- the drafter will anchor on "
++                    "REJECTED rows and acceptance will collapse. Add the "
++                    "delegation, or set disable_padded_drafter_batch=true.",
++                    type(self.model).__name__,
++                )
++
+         per_group_attn_metadata, per_layer_attn_metadata = (
+             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+         )
+@@ -585,13 +641,32 @@
  
          block_size = self.block_size
          assert block_size > 0, "block_size has not been initialized."
@@ -2543,7 +2598,7 @@
                  positions = self._update_positions_dependent_metadata(
                      positions,
                      common_attn_metadata,
-@@ -603,7 +653,9 @@
+@@ -603,7 +678,9 @@
              # Rebuild attention metadata. When draft positions are constant
              # (e.g. Gemma4 MTP), common_attn_metadata is invariant across
              # loop iterations so we build once and reuse.
@@ -2554,7 +2609,7 @@
                  _, per_layer_attn_metadata = (
                      self.build_per_group_and_layer_attn_metadata(
                          common_attn_metadata, draft_index=token_index + 1
-@@ -611,8 +663,13 @@
+@@ -611,8 +688,13 @@
                  )
  
              # copy inputs to buffer for cudagraph
@@ -2570,7 +2625,7 @@
              if self.supports_mm_inputs:
                  self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
  
-@@ -630,6 +687,12 @@
+@@ -630,6 +712,12 @@
              }
              if self.pass_hidden_states_to_model:
                  model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
@@ -2583,7 +2638,7 @@
  
              with set_forward_context(
                  per_layer_attn_metadata,
-@@ -1551,6 +1614,11 @@
+@@ -1551,6 +1639,11 @@
          for id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
              for layer_name in kv_cache_group.layer_names:
                  kv_cache_groups[layer_name] = id
