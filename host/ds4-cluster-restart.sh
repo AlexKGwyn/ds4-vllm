@@ -154,8 +154,20 @@ echo "   warmup dispatched (ctx=$WARMUP_CTX; log: $WARMUP_LOG)"
 echo "== verify =="
 grep -aE "GPU KV cache size|Maximum concurrency" "$SERVE_LOG" 2>/dev/null \
   | tail -2 | sed 's/^/   /'
-rdma=$(grep -aoE "odl_ar2: rank[0-9] ready[^\"]*" "$SERVE_LOG" 2>/dev/null | head -1)
-echo "   fast AR: ${rdma:-!! odl_ar2 NOT ready -- decode all-reduce is on the slow path}"
+if [ "$TRANSPORT" = ib ] || [ "$TRANSPORT" = tcp ]; then
+  # No odl_ar2 on these transports (RCCL or ib_ar2 owns the collective). For
+  # ib, verify the pinned HCA is ACTIVE (opensm assigned a LID) and ib_ar2 came
+  # up -- that is the link the decode all-reduce runs on.
+  if [ "$TRANSPORT" = ib ]; then
+    ibl=$(rdma link 2>/dev/null | grep -w ACTIVE | grep -wF "${DS4_RDMA_HCA%%:*}" | head -1)
+    echo "   RDMA: ${ibl:-!! ${DS4_RDMA_HCA:-mlx4_0} not ACTIVE -- check cable / opensm container on box1}"
+    ar=$(grep -aoE "ib_ar2: rank[0-9] ready[^\"]*" "$SERVE_LOG" 2>/dev/null | head -1)
+    echo "   fast AR: ${ar:-!! ib_ar2 NOT ready -- decode all-reduce is on RCCL (DS4_IB_AR2 off or init failed)}"
+  fi
+else
+  rdma=$(grep -aoE "odl_ar2: rank[0-9] ready[^\"]*" "$SERVE_LOG" 2>/dev/null | head -1)
+  echo "   fast AR: ${rdma:-!! odl_ar2 NOT ready -- decode all-reduce is on the slow path}"
+fi
 echo "   vllm serve procs: $(ps -eo cmd --no-headers | grep -c 'bin/[v]llm serve deepseek') (want 1)"
 echo "   ray idle workers: $(ps -eo cmd --no-headers | grep -c '[r]ay::IDLE')"
 echo "   MemAvailable: $(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo)MB"

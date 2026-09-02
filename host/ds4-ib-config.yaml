@@ -1,0 +1,21 @@
+# InfiniBand-transport test profile: the serving Vision-Exp stack with the
+# TP collectives moved from OdinLink to RCCL-over-IB (ConnectX-3 mlx4 fabric).
+# Start explicitly with:
+#   DS4_CONFIG_PATH="$HOME/ds4-ib-config.yaml" "$HOME/ds4-cluster-restart.sh"
+# ds4-vision-config.yaml (transport: odl) remains the boot default/rollback.
+# Same flat key: value format as ds4-config.yaml, parsed by ds4-config.
+model: /home/alex/ds4-vision   # local Vision-Exp checkout; weights needed on BOTH boxes
+hf_overrides: {"architectures":["DeepseekV4VForConditionalGeneration"],"num_nextn_predict_layers":1}
+transport: ib
+head_ip: 192.168.100.1
+worker_ip: 192.168.100.2
+container: vllm
+rdma_hca: mlx4_0:1     # NCCL_IB_HCA pin: the ConnectX-3, port 1 (the cabled port)
+api_port: 1236
+disk_kv: false
+disk_kv_gib: 30
+max_ctx: 524288
+kv_pin_gib: 6
+gpu_mem_util: 0.83
+warmup_ctx: 2048
+spec_tokens: 5       # MTP-5, same as production

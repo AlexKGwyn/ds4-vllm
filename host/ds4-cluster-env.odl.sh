@@ -8,6 +8,11 @@
 source "$HOME/ds4-cluster-env.sh"
 export NCCL_IB_DISABLE=1
 unset  NCCL_IB_HCA NCCL_IB_GID_INDEX
+# The base env pins NCCL_PROTO=LL (right when RCCL carried the tiny decode
+# all-reduces). odl_ar2 owns those here; RCCL over the plugin only sees
+# prefill-sized ops, where LL's flag-byte inflation halves the link: 4MiB AR
+# med 5962us (LL) vs 2858us (auto). Unset = RCCL picks per size.
+unset NCCL_PROTO
 # RCCL dlopens the plugin at this exact path (built into the image by the
 # odinlink-build stage); libodl_tb5.so.0 resolves from the plugin's rpath.
 export NCCL_NET_PLUGIN=/usr/local/lib/odinlink/librccl_net_odl_tb5.so
