@@ -5,14 +5,14 @@
 # container is verified exec-able (container-heal.sh starts/reconciles it)
 # before Ray comes up, so this works from a fresh boot.
 #
-# Two things this encodes that a bare `systemctl restart` gets wrong:
+# Two things this encodes that a naive stop/start gets wrong:
 #
-#   1. REAPING. `ds4-vllm-manual` is a transient systemd-run unit supervising a
-#      `podman exec` wrapper, NOT the process inside the container. Stopping the
-#      unit kills the wrapper and leaves `vllm serve` running, holding its port
-#      and ~0.4 GB. Repeated restarts strand one husk each. We stop the unit,
-#      then explicitly kill any surviving `vllm serve` and confirm zero remain
-#      before bringing anything back up.
+#   1. REAPING. What we supervise is a `podman exec` WRAPPER, not the process
+#      inside the container. Killing the wrapper leaves `vllm serve` running,
+#      holding its port and ~0.4 GB, and repeated restarts strand one husk
+#      each. So the pid file is only the first step: we then explicitly kill any
+#      surviving `vllm serve` and confirm zero remain before bringing anything
+#      back up. That reap, not the pid file, is what makes this safe.
 #
 #   2. RAY WORKER POOL. `ray start` passes --num_prestart_python_workers=<num_cpus>
 #      straight through (ray/_private/services.py:1980) -- there is no env
@@ -33,14 +33,27 @@ HEAD_IP=${DS4_HEAD_IP:?ds4-config.yaml: head_ip missing}
 WORKER_IP=${DS4_WORKER_IP:?ds4-config.yaml: worker_ip missing}
 PORT=${DS4_API_PORT:-1234}
 CTR=${DS4_CONTAINER:-vllm}
-TRANSPORT=${DS4_TRANSPORT:-rdma}
+TRANSPORT=${DS4_TRANSPORT:-odl}
 RAYTMP=$HOME/ray-tmp
 RAY_NUM_CPUS=${RAY_NUM_CPUS:-4}
 CENV=$HOME/ds4-cluster-env.$TRANSPORT.sh
 SERVE=$HOME/ds4-vllm-manual-serve.sh
-UNIT=ds4-vllm-manual
-# Exports that must reach the env files on BOTH boxes (sourced at ray start).
-ENVPASS="export DS4_RDMA_HCA=${DS4_RDMA_HCA:-};"
+# Supervision is a pid file plus a log file -- no systemd. Wiring this to a unit
+# is left to the operator; examples/systemd/ has one that calls ds4-serve.sh.
+RUN_DIR=${DS4_RUN_DIR:-${XDG_RUNTIME_DIR:-/tmp}/ds4-vllm}
+LOG_DIR=${DS4_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ds4-vllm}
+PIDFILE=$RUN_DIR/serve.pid
+SERVE_LOG=$LOG_DIR/serve.log
+WARMUP_LOG=$LOG_DIR/warmup.log
+mkdir -p "$RUN_DIR" "$LOG_DIR"
+# Exports that must reach Ray before its workers are spawned. Control-interface
+# names can differ between otherwise identical hosts, so keep one payload per
+# node while retaining common transport settings.
+CONTROL_IFACE_HEAD=${DS4_CONTROL_IFACE_HEAD:-thunderbolt0}
+CONTROL_IFACE_WORKER=${DS4_CONTROL_IFACE_WORKER:-thunderbolt0}
+ODL_RANK1_IP=${DS4_ODL_RANK1_IP:-$WORKER_IP}
+HEAD_ENVPASS="export DS4_RDMA_HCA=${DS4_RDMA_HCA:-}; export DS4_CONTROL_IFACE=$CONTROL_IFACE_HEAD; export DS4_ODL_RANK1_IP=$ODL_RANK1_IP;"
+WORKER_ENVPASS="export DS4_RDMA_HCA=${DS4_RDMA_HCA:-}; export DS4_CONTROL_IFACE=$CONTROL_IFACE_WORKER; export DS4_ODL_RANK1_IP=$ODL_RANK1_IP;"
 [ -f "$CENV" ] || { echo "!! $CENV missing (transport=$TRANSPORT)"; exit 1; }
 # Memory + disk-KV knobs: yaml -> the DS4_* the serve script reads.
 case "${DS4_DISK_KV:-true}" in true|1|on|yes) DISK_KV=1;; *) DISK_KV=0;; esac
@@ -55,8 +68,10 @@ box2() { timeout "${2:-120}" ssh -o BatchMode=yes "$WORKER_IP" "$1"; }
 inbox() { timeout "${2:-120}" podman exec -u 1000:1000 -w "$HOME" "$CTR" bash -lc "$1"; }
 
 echo "== teardown =="
-systemctl --user stop "$UNIT.service" 2>/dev/null
-systemctl --user reset-failed "$UNIT.service" 2>/dev/null
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")" 2>/dev/null
+fi
+rm -f "$PIDFILE"
 sleep 4
 
 # The bracket keeps this grep from matching its own command line.
@@ -91,11 +106,11 @@ echo "== ray =="
 # --include-dashboard is head-only; ray PANICs if it is passed to a worker.
 RAYFLAGS="--num-gpus=1 --num-cpus=$RAY_NUM_CPUS --temp-dir=$RAYTMP"
 HEADFLAGS="$RAYFLAGS --include-dashboard=false"
-if ! out=$(inbox "$ENVPASS source $CENV; ray start --head --node-ip-address=$HEAD_IP --port=6379 $HEADFLAGS" 180 2>&1); then
+if ! out=$(inbox "$HEAD_ENVPASS source $CENV; ray start --head --node-ip-address=$HEAD_IP --port=6379 $HEADFLAGS" 180 2>&1); then
   echo "!! box1 ray start failed:"; echo "$out" | tail -5 | sed 's/^/     /'; exit 1
 fi
 echo "   box1 head up"
-if ! out=$(box2 "podman exec -u 1000:1000 -w \$HOME $CTR bash -lc '$ENVPASS source $CENV; ray start --address=$HEAD_IP:6379 --node-ip-address=$WORKER_IP $RAYFLAGS'" 180 2>&1); then
+if ! out=$(box2 "podman exec -u 1000:1000 -w \$HOME $CTR bash -lc '$WORKER_ENVPASS source $CENV; ray start --address=$HEAD_IP:6379 --node-ip-address=$WORKER_IP $RAYFLAGS'" 180 2>&1); then
   echo "!! box2 ray start failed:"; echo "$out" | tail -5 | sed 's/^/     /'; exit 1
 fi
 echo "   box2 worker up"
@@ -109,17 +124,22 @@ done
 echo "   ray: $g  (prestart python workers capped at $RAY_NUM_CPUS/node, dashboard off)"
 
 echo "== serve =="
-systemd-run --user --unit="$UNIT" --description="DS4 vLLM TP=2 (disk KV)" \
-  --working-directory="$HOME" \
-  /usr/bin/podman exec -u 1000:1000 -w "$HOME" "$CTR" bash -lc \
-  "$ENVPASS export DS4_TRANSPORT=$TRANSPORT DS4_DISK_KV=$DISK_KV DS4_DISK_KV_BYTES=$DISK_KV_BYTES DS4_KV_BYTES=$KV_BYTES DS4_GPU_UTIL=$GPU_UTIL DS4_MODEL=$MODEL DS4_API_PORT=$PORT DS4_MAX_CTX=$MAX_CTX; exec bash $SERVE" >/dev/null 2>&1
+# setsid so the server outlives this script and its terminal. Its stdout is the
+# only record of the boot, so it goes to a file rather than /dev/null -- the
+# verify block below reads it back.
+: > "$SERVE_LOG"
+setsid podman exec -u 1000:1000 -w "$HOME" "$CTR" bash -lc \
+  "$HEAD_ENVPASS export DS4_TRANSPORT=$TRANSPORT DS4_DISK_KV=$DISK_KV DS4_DISK_KV_BYTES=$DISK_KV_BYTES DS4_KV_BYTES=$KV_BYTES DS4_GPU_UTIL=$GPU_UTIL DS4_MODEL=$MODEL DS4_API_PORT=$PORT DS4_MAX_CTX=$MAX_CTX; exec bash $SERVE" \
+  >"$SERVE_LOG" 2>&1 </dev/null &
+echo $! > "$PIDFILE"
 
 # Warm bringup answers in ~4 min; a cold kernel-cache bringup (first after a
 # cache wipe) spends ~25 min more in Triton/LLVM compiles before the API is up.
 for _ in $(seq 1 105); do
   code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" "http://127.0.0.1:$PORT/v1/models" 2>/dev/null)
   [ "$code" = "200" ] && break
-  systemctl --user is-active --quiet "$UNIT.service" || { echo "!! unit died during boot"; exit 1; }
+  kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null || {
+    echo "!! serve died during boot -- last lines of $SERVE_LOG:"; tail -20 "$SERVE_LOG" | sed 's/^/     /'; exit 1; }
   sleep 20
 done
 [ "$code" = "200" ] || { echo "!! API never came up"; exit 1; }
@@ -127,19 +147,27 @@ done
 # Warm the JIT kernels, the bf16 weight cache, and the prefill-indexer buckets
 # so the first real request runs at full prefill speed. Backgrounded transient
 # unit: bringup finishes now, warmup follows in ~a minute. Best-effort.
-systemctl --user reset-failed ds4-vllm-warmup.service 2>/dev/null
-systemd-run --user --collect --unit=ds4-vllm-warmup \
-  --setenv=DS4_VLLM_PORT=$PORT --setenv=DS4_WARMUP_CTX=$WARMUP_CTX \
-  /usr/bin/python3 "$HOME/ds4-vllm-warmup.py" >/dev/null 2>&1 \
-  && echo "   warmup dispatched (ctx=$WARMUP_CTX; journalctl --user -u ds4-vllm-warmup)" \
-  || echo "   warmup dispatch failed (non-fatal)"
+DS4_VLLM_PORT=$PORT DS4_WARMUP_CTX=$WARMUP_CTX \
+  setsid python3 "$HOME/ds4-vllm-warmup.py" >"$WARMUP_LOG" 2>&1 </dev/null &
+echo "   warmup dispatched (ctx=$WARMUP_CTX; log: $WARMUP_LOG)"
 
 echo "== verify =="
-journalctl --user -u "$UNIT.service" --no-pager -o cat --since "-20min" 2>/dev/null \
-  | grep -aE "GPU KV cache size|Maximum concurrency" | tail -2 | sed 's/^/   /'
-rdma=$(journalctl --user -u "$UNIT.service" --no-pager -o cat --since "-20min" 2>/dev/null \
-  | grep -aoE "tbv_ar2: rank[0-9] ready \(qpn=[0-9]+ peer_qpn=[0-9]+\)" | head -1)
-echo "   RDMA: ${rdma:-!! tbv_ar2 NOT ready -- decode all-reduce is not on RDMA}"
+grep -aE "GPU KV cache size|Maximum concurrency" "$SERVE_LOG" 2>/dev/null \
+  | tail -2 | sed 's/^/   /'
+if [ "$TRANSPORT" = ib ] || [ "$TRANSPORT" = tcp ]; then
+  # No odl_ar2 on these transports (RCCL or ib_ar2 owns the collective). For
+  # ib, verify the pinned HCA is ACTIVE (opensm assigned a LID) and ib_ar2 came
+  # up -- that is the link the decode all-reduce runs on.
+  if [ "$TRANSPORT" = ib ]; then
+    ibl=$(rdma link 2>/dev/null | grep -w ACTIVE | grep -wF "${DS4_RDMA_HCA%%:*}" | head -1)
+    echo "   RDMA: ${ibl:-!! ${DS4_RDMA_HCA:-mlx4_0} not ACTIVE -- check cable / opensm container on box1}"
+    ar=$(grep -aoE "ib_ar2: rank[0-9] ready[^\"]*" "$SERVE_LOG" 2>/dev/null | head -1)
+    echo "   fast AR: ${ar:-!! ib_ar2 NOT ready -- decode all-reduce is on RCCL (DS4_IB_AR2 off or init failed)}"
+  fi
+else
+  rdma=$(grep -aoE "odl_ar2: rank[0-9] ready[^\"]*" "$SERVE_LOG" 2>/dev/null | head -1)
+  echo "   fast AR: ${rdma:-!! odl_ar2 NOT ready -- decode all-reduce is on the slow path}"
+fi
 echo "   vllm serve procs: $(ps -eo cmd --no-headers | grep -c 'bin/[v]llm serve deepseek') (want 1)"
 echo "   ray idle workers: $(ps -eo cmd --no-headers | grep -c '[r]ay::IDLE')"
 echo "   MemAvailable: $(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo)MB"

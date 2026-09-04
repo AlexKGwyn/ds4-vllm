@@ -2,8 +2,8 @@
 
 A reproducible rebuild of the hand-patched vLLM engine that serves
 **DeepSeek-V4-Flash** across **two AMD Strix Halo (gfx1151) boxes**, tensor-parallel
-(TP=2), with the inter-GPU all-reduce carried over a **Thunderbolt-4 / USB4 RDMA**
-link. It contains everything needed to reconstruct the *software* from a public
+(TP=2), with the inter-GPU all-reduce carried over a **Thunderbolt-4 / USB4**
+link (the OdinLink driver). It contains everything needed to reconstruct the *software* from a public
 base image plus the host-side scripts that launch and drive it.
 
 This code and stack was pretty much entirely put together by AI, I probably can not help too much outside of prompting my agent.
@@ -40,17 +40,18 @@ order:
 # 0. model weights, ~150 GB, on BOTH boxes (https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
 hf download deepseek-ai/DeepSeek-V4-Flash-0731
 
-# 1. RDMA kernel modules, on BOTH boxes, then reboot both together
-tbv/build-modules.sh && sudo tbv/install-modules.sh
+# 1. Thunderbolt fabric, on BOTH boxes (stock kernel; ONE cable between them)
+odinlink/build-odinlink.sh && sudo odinlink/install-odinlink.sh
+#    migrating from the old tbv stack? sudo odinlink/uninstall-tbv.sh --apply first
 
 # 2. the patched vLLM image (box1; copy to box2 with podman save | podman load)
 container/build.sh                                  # then create the distrobox — §2 below
 
 # 3. site config + host scripts
-#    edit host/ds4-config.yaml (IPs, transport, cables, memory) and deploy per §3
+#    edit host/ds4-config.yaml (IPs, transport, memory) and deploy per §3
 
 # 4. launch (box1) — full 2-box bringup, OpenAI API on :1234 when done
-systemctl --user start ds4-vllm
+host/ds4-serve.sh start
 ```
 
 Full ordered runbook with the gates and gotchas: [`AGENTS.md`](AGENTS.md).
@@ -60,12 +61,12 @@ Full ordered runbook with the gates and gotchas: [`AGENTS.md`](AGENTS.md).
 > **Read this first — what "rebuildable" means here.** The **container rebuilds
 > deterministically on any machine** with podman (`container/` below). *Serving*
 > the model, however, needs the matching rig: 2× gfx1151 boxes, a working
-> Thunderbolt-4 RDMA fabric, ROCm 7, and the model weights. This is a
+> Thunderbolt fabric, ROCm 7, and the model weights. This is a
 > hardware-specific research build, not a general-purpose vLLM package. See
 > **Prerequisites**.
 >
 > **Setting it up? Follow [`AGENTS.md`](AGENTS.md)** — the ordered end-to-end
-> runbook (RDMA → container → serve) written for a person or agent doing the
+> runbook (fabric → container → serve) written for a person or agent doing the
 > bring-up on a fresh pair of boxes.
 
 ---
@@ -73,8 +74,7 @@ Full ordered runbook with the gates and gotchas: [`AGENTS.md`](AGENTS.md).
 ## License & attribution
 
 Original work here is **Apache-2.0** ([LICENSE](LICENSE)). This project
-builds on **vLLM** (Apache-2.0), the **Linux kernel thunderbolt drivers** and
-**hellas-ai/thunderbolt-ibverbs** (GPL-2.0), and **rdma-core** — their
+builds on **vLLM** (Apache-2.0) and **Geramy/OdinLink-Five** (GPL-2.0) — their
 sources are fetched at pinned revisions at build time rather than
 redistributed; the patches shipped here are derivative works licensed like
 the code they modify. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
@@ -85,29 +85,31 @@ for the full component/license table and upstream references.
 ## Layout
 
 ```
-ds4-vllm-share/
+ds4vllm-public/
 ├── README.md                     ← this file
-├── AGENTS.md                     ← ordered bring-up runbook (RDMA → container → serve)
+├── AGENTS.md                     ← ordered bring-up runbook (fabric → container → serve)
 ├── container/                    ← rebuild the patched vLLM engine (route 2)
 │   ├── Dockerfile                ← FROM kyuz0 gfx1151 base + COPY the patch-set
 │   ├── build.sh                  ← podman build helper (runs the packaging tests first)
 │   ├── verify-patches.sh         ← prove patches/ really is base → rootfs
-│   ├── rootfs/                   ← the 12 NEW files at their real paths (modified files ship as the patch)
+│   ├── rootfs/                   ← the NEW files at their real paths (modified files ship as the patch)
 │   └── patches/                  ← vllm-upstream.patch (base → patched) + MANIFEST.md
-├── tbv/                          ← Thunderbolt-4 / USB4 soft-RDMA stack (the interconnect)
-│   ├── ibverbs-local.patch       ← our diff on the pinned upstream thunderbolt-ibverbs
-│   ├── nhi-throttle-mod/         ← NHI IRQ-throttle module source
-│   ├── build-scripts/, bringup/  ← per-kernel build recipes + coordinated bring-up
-│   ├── systemd/                  ← boot units (matched core+net; RoCE bring-up)
+├── odinlink/                     ← the Thunderbolt fabric (OdinLink driver, transport: odl)
+│   ├── build-odinlink.sh         ← fetch pinned OdinLink-Five + build odl_tb5.ko (host)
+│   ├── install-odinlink.sh, odl-swap.sh, systemd/ ← install + MOK-sign + boot unit
+│   ├── uninstall-tbv.sh          ← remove a previous tbv/ibverbs deployment
+│   ├── nhi-throttle-mod/         ← optional NHI IRQ-throttle module (latency)
+│   ├── odinlink-local.patch, ar2/ ← our diff on the pin; odl_ar2 decode all-reduce
 ├── host/                         ← host-side orchestration (run outside the container)
 │   ├── ds4-config.yaml, ds4-config ← site config (IPs, transport, disk KV) + loader
-│   ├── ds4-cluster-restart.sh    ← full validated bringup (ExecStart of ds4-vllm.service)
-│   ├── ds4-cluster-down.sh       ← full teardown (ExecStop/StopPost)
+│   ├── ds4-serve.sh              ← start | stop | restart | status | logs (the entry point)
+│   ├── ds4-cluster-restart.sh    ← full validated bringup (what `start` runs)
+│   ├── ds4-cluster-down.sh       ← full teardown (what `stop` runs)
 │   ├── ds4-vllm-manual-serve.sh  ← the vllm serve invocation + all serving flags
 │   ├── ds4-vllm-warmup.py        ← post-start JIT/prefill-cache warmer (warmup_ctx)
-│   ├── ds4-cluster-env*.sh       ← canonical env + DS4_* tuning knobs (rdma/tcp variants)
-│   ├── container-heal.sh         ← reconcile/start a wedged podman container
-│   └── systemd/                  ← ds4-vllm.service
+│   ├── ds4-cluster-env*.sh       ← canonical env + DS4_* tuning knobs (odl/tcp variants)
+│   └── container-heal.sh         ← reconcile/start a wedged podman container
+├── examples/systemd/             ← OPTIONAL unit wrapping ds4-serve.sh (not installed)
 ```
 
 ---
@@ -119,15 +121,20 @@ ds4-vllm-share/
 - **ROCm 7** (provided inside the container via the kyuz0 base — you do not
   install it on the host).
 - **podman** + **distrobox** on both hosts (rootless is fine; the live setup uses it).
-- **Thunderbolt-4 / USB4 RDMA** between the boxes. The scripts expect an RDMA
-  device named `usb4_rdma` and a `thunderbolt0` IP interface (head IP
-  `192.168.100.1`). This depends on the custom `tbv` kernel modules — **included**
-  in [`tbv/`](tbv/) (source + build scripts + reference binaries; see
-  [`tbv/README.md`](tbv/README.md) and [`AGENTS.md`](AGENTS.md) §1). They are
-  kernel-version-specific and must be rebuilt per kernel. **Secure Boot must be
-  disabled** (or sign the modules with your own MOK) — they are unsigned and a
-  Secure Boot kernel refuses to load them. Without RDMA, the stack still runs
+- **Exactly one Thunderbolt-4 / USB4 cable** between the boxes, carrying both
+  the OdinLink RDMA fabric and the `thunderbolt0` IP interface the cluster
+  bootstraps over. A second cable puts the peer at the same route on both
+  links and breaks peer demultiplexing — see [`odinlink/README.md`](odinlink/README.md).
+  The driver is built from [`odinlink/`](odinlink/) against a **stock kernel**
+  (no patched thunderbolt core, no blacklist, no kernel arguments) and is
+  vermagic-locked, so rebuild it after a kernel update. **Secure Boot must be
+  disabled** unless the box has an enrolled MOK — the load path signs the
+  module with it when one is present. Without the fabric the stack still runs
   on `transport: tcp` (much slower decode).
+- **Previously ran the old `tbv` ibverbs stack?** Run
+  `sudo odinlink/uninstall-tbv.sh --apply` and reboot before building. It
+  removes the `blacklist=thunderbolt` kernel arguments, without which no
+  thunderbolt driver loads at all.
 - **Model weights**: [`deepseek-ai/DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
   (~150 GB checkpoint). Not included — `hf download deepseek-ai/DeepSeek-V4-Flash-0731`
   on both boxes (the `model:` key in `ds4-config.yaml` takes an HF id or a local
@@ -143,12 +150,11 @@ cd container
 ```
 
 This does `FROM docker.io/kyuz0/vllm-therock-gfx1151@<pinned-digest>`, applies
-`container/patches/vllm-upstream.patch` to the base's own vLLM sources (31
-files), overlays the 12 new files from `container/rootfs/`
+`container/patches/vllm-upstream.patch` to the base's own vLLM sources (36
+files), overlays the 15 new files from `container/rootfs/`
 (see [`container/patches/MANIFEST.md`](container/patches/MANIFEST.md)), builds
-the `usb4_rdma` libibverbs provider from source (rdma-core `v57.0` + the
-upstream provider patches, both fetched at pinned revisions), compiles the
-TB4-RDMA all-reduce natives, and rebuilds ROCr with the idle-wait fix. The
+the OdinLink userspace (the RCCL net plugin and the `odl_ar2` all-reduce, both
+fetched at a pinned revision), and rebuilds ROCr with the idle-wait fix. The
 base is ~35 GB and is pulled on first build; network is needed on the first
 build for the pinned source fetches.
 
@@ -197,11 +203,13 @@ site) as `~/ds4-config.yaml` on box1 next to the scripts:
 
 ```yaml
 model: deepseek-ai/DeepSeek-V4-Flash-0731   # HF id or local path; weights on BOTH boxes
-transport: rdma        # rdma | tcp — which ds4-cluster-env.<transport>.sh the cluster sources
+transport: odl         # odl | tcp — which ds4-cluster-env.<transport>.sh the cluster sources
 head_ip: 192.168.100.1
 worker_ip: 192.168.100.2
 container: vllm        # podman container name (same on both boxes)
-rdma_hca: usb4_rdma0   # NCCL_IB_HCA pin, rdma transport only
+control_iface_head: thunderbolt0   # NCCL/GLOO bootstrap-socket interface per box
+control_iface_worker: thunderbolt0
+odl_rank1_ip: 192.168.100.2        # odl_ar2 rendezvous address (usually = worker_ip)
 api_port: 1234
 disk_kv: true          # NVMe prefix-KV tier (fs_lru); prefixes survive restarts
 disk_kv_gib: 30        # per-NODE disk cap; check df on BOTH boxes before raising
@@ -209,26 +217,52 @@ max_ctx: 524288        # --max-model-len (512K, the validated profile)
 kv_pin_gib: 6          # pinned GPU KV pool; sized against MemAvailable, not grown by max_ctx
 gpu_mem_util: 0.83     # vLLM --gpu-memory-utilization; IGNORED while the KV pin above is set
 warmup_ctx: 2048       # post-start warmup prefill size; 0 disables
-cables: 1              # Thunderbolt cables between the boxes: 1 works; 2 adds the RX zero-copy rail
 ```
 
 `host/ds4-config` (stdlib Python, no pyyaml) turns it into `DS4_*` exports for
-the scripts. `transport: tcp` runs the same cluster without RDMA (correctness /
-fallback profile; the tbv_ar decode all-reduce is disabled).
+the scripts. `transport: odl` is the fabric; `transport: tcp` runs the same
+cluster over plain sockets (correctness / fallback profile, with the `odl_ar2`
+decode all-reduce disabled) and is useful for isolating a bring-up problem to
+the fabric or the model path.
 
 Deploy (paths are `$HOME`-relative, same layout on both boxes):
 
-- **box1**: `host/ds4-config{,.yaml}`, `ds4-cluster-restart.sh`,
-  `ds4-cluster-down.sh`, `ds4-vllm-manual-serve.sh`, `ds4-vllm-warmup.py`,
-  `container-heal.sh`, all three `ds4-cluster-env*.sh`, and
-  `host/systemd/ds4-vllm.service` into `~/.config/systemd/user/`.
+- **box1**: `host/ds4-config{,.yaml}`, `ds4-serve.sh`,
+  `ds4-cluster-restart.sh`, `ds4-cluster-down.sh`, `ds4-vllm-manual-serve.sh`,
+  `ds4-vllm-warmup.py`, `container-heal.sh`, and every `ds4-cluster-env*.sh`.
 - **box2**: `ds4-cluster-env*.sh` and `container-heal.sh` only — box2 is driven
   over ssh (key auth box1→box2 required).
 
-Then `systemctl --user start ds4-vllm` brings up the whole 2-box cluster
-(teardown → container heal → ray on both boxes → `vllm serve` → API/RDMA
-verify); `stop` tears it down. The env files must stay **identical on both
+Then `./ds4-serve.sh start` brings up the whole 2-box cluster (teardown →
+container heal → ray on both boxes → `vllm serve` → API/all-reduce verify);
+`stop` tears it down and `status` reports on it. There is no systemd here on
+purpose — `examples/systemd/ds4-vllm.service` wraps the same script if you
+want a unit. The env files must stay **identical on both
 boxes** — the two TP ranks silently diverge otherwise. 
+
+---
+
+## OdinLink transport
+
+`transport: odl` carries the inter-box fabric on the
+[OdinLink](https://github.com/Geramy/OdinLink-Five) Thunderbolt driver
+(`odl_tb5`): RCCL runs over the OdinLink net plugin and the decode all-reduce
+over `odl_ar2`, both built into the image — the kernel driver is the only host
+build, and it builds against a **stock kernel**. Requires **exactly one**
+Thunderbolt cable between the boxes.
+
+Bring-up, on **both** boxes:
+
+```bash
+odinlink/build-odinlink.sh            # driver + lib, stock headers, no sudo
+sudo odinlink/install-odinlink.sh     # stage /usr/local + enable odinlink.service
+sudo systemctl start odinlink.service # or reboot; the driver then loads at boot
+```
+
+The load path signs `odl_tb5.ko` with the host's enrolled MOK when one is
+present, so it can load under Secure Boot (see **Prerequisites**). Once
+`odl-state` reports `state=ready` on both boxes, start the cluster normally.
+Details, constraints and the local patch inventory: [`odinlink/`](odinlink/).
 
 ---
 
@@ -242,12 +276,22 @@ The themes:
 - **Mid-context retrieval** — the sparse indexer runs the *official* QAT graph
   (Hadamard128 + FP4 sim) before top-512 scoring (`DS4_IDX_OFFICIAL`), which the
   stock FP8 indexer skipped; plus a ROCm sparse-MLA attention rewrite.
+- **Hand-written decode kernels** — an MXFP4 MoE decode path (gemm1 + fused
+  SILU/clamp + gemm2 with fused scatter, one contiguous march per workgroup
+  instead of the against-the-grain tile the stock path reads) and a dense fp8
+  GEMV that replaces a bf16 path reading twice the bytes. Both are ctypes
+  wrappers over libraries built in-image from `container/native/`, and both fall
+  back to the stock path on any layout they do not recognise, so a missing
+  library costs speed and never correctness.
+- **Reasoning effort levels** — `low` / `high` / `max` / `none` all render.
+  The encoder in the base image emitted a preamble only for `max` and silently
+  ignored `high`, so a server configured for high reasoning got no preamble and
+  no error; upstream's table is backported so the setting means something.
 - **MoE / GEMM tuning** — decode-scoped MXFP4 `matmul_ogs` knobs
   (`DS4_MOE_BN/NW/NS/BK/WPE`, the `block_k` bandwidth lever), a tuned gfx1151
   A8W8 GEMM config, and a `DS4_W8A8_BF16` fast bf16 path.
-- **Thunderbolt-4 RDMA all-reduce** — custom `tbv_ar` (v1) / `tbv_ar2` (v2)
-  all-reduce hooked into vLLM's communicator, replacing NCCL for the TP
-  all-reduce on the TB4 link.
+- **Thunderbolt all-reduce** — `odl_ar2` hooked into vLLM's communicator,
+  replacing RCCL for the decode TP all-reduce on the Thunderbolt link.
 - **Disk KV cache** an `fs_lru` secondary
   tier gives the KV offloader a byte cap with LRU eviction, which the stock `fs`
   tier has no mechanism for, so it can point at a filesystem shared with

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TCP-transport override for the DS4 vLLM cluster (`transport: tcp` in
 # ds4-config.yaml). Runs the same 2-box cluster over sockets on thunderbolt0
-# with IB/RDMA and the tbv_ar all-reduce disabled -- the correctness/fallback
+# with IB/RDMA and the fast all-reduce disabled -- the correctness/fallback
 # profile for when the RDMA rails are unavailable. Much slower decode.
 source "$HOME/ds4-cluster-env.sh"
 export NCCL_IB_DISABLE=1

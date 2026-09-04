@@ -1,0 +1,504 @@
+diff --git a/driver/odl_tb5_core.h b/driver/odl_tb5_core.h
+index ca9e4d7..d5c1267 100644
+--- a/driver/odl_tb5_core.h
++++ b/driver/odl_tb5_core.h
+@@ -228,6 +228,11 @@ struct odl_tb5_rx_msg {
+ 	u8			flags;
+ 	void			*data;
+ 	size_t			len;
++	/* True when ->data is a stream assembly buffer handed over whole
++	 * instead of a copy. Those come from the preallocated pool and must go
++	 * back to it (kvfree, not kfree); mixing the two corrupts the pool
++	 * accounting and frees kvmalloc memory with the wrong allocator. */
++	bool			data_from_pool;
+ };
+ 
+ /* ── Per-stream state ────────────────────────────────────────────────── */
+@@ -263,6 +268,20 @@ struct odl_tb5_stream {
+ 	bool			rx_asm_bad;
+ 	atomic_t		rx_frag_drops;
+ 
++	/* Spare assembly buffers, all odl_rx_asm_max bytes, all allocated at
++	 * stream_create where GFP_KERNEL may reclaim and compact. MSG_END hands
++	 * rx_asm_buf to the reader and takes its replacement from here, so the
++	 * RX callback never has to ask the allocator for a multi-page block in
++	 * atomic context — the allocation that used to fail on a fragmented
++	 * host and deliver a short message as if it were complete.
++	 * Stack of ->n free pointers; ->lock covers both (the callback pops in
++	 * IRQ context, readers push from process context). */
++	void			**rx_asm_pool;
++	unsigned int		rx_asm_pool_cap;
++	unsigned int		rx_asm_pool_n;
++	spinlock_t		rx_asm_pool_lock;
++	atomic_t		rx_asm_pool_empty;
++
+ 	/* Set once, before waking every waiter, when the stream is being torn
+ 	 * down. Waiters must test this or they sleep on a stream that no longer
+ 	 * exists — closing a stream is how consumers cancel a blocking receive
+@@ -582,6 +601,8 @@ extern int odl_loopback_count;
+ extern int odl_protocol_mode;
+ extern bool odl_e2e;
+ extern unsigned int odl_busy_poll_us;
++extern unsigned int odl_rx_asm_max;
++extern unsigned int odl_rx_asm_pool;
+ extern int odl_max_devices;
+ extern bool odl_bind_any;
+ extern bool odl_skip_login;
+diff --git a/driver/odl_tb5_params.c b/driver/odl_tb5_params.c
+index 68d62bd..db81080 100644
+--- a/driver/odl_tb5_params.c
++++ b/driver/odl_tb5_params.c
+@@ -49,6 +49,29 @@ module_param(odl_busy_poll_us, uint, 0644);
+ MODULE_PARM_DESC(odl_busy_poll_us,
+ 	"Bounded RX busy-poll window in microseconds before sleeping (0 = off)");
+ 
++/* Per-stream RX reassembly buffer, allocated once at stream creation.
++ * It used to be grown from the RX callback with kmalloc(GFP_ATOMIC), which for
++ * a 1 MiB buffer is an order-8 request that cannot reclaim or compact and so
++ * fails on a fragmented host even with gigabytes free -- and the failure
++ * silently truncated the message. Sized once here instead; a message larger
++ * than this is refused loudly rather than assembled short. */
++unsigned int odl_rx_asm_max = 2 * 1024 * 1024;
++module_param_named(rx_asm_max, odl_rx_asm_max, uint, 0444);
++MODULE_PARM_DESC(rx_asm_max,
++	"Max reassembled RX message in bytes, preallocated per stream (default 2 MiB)");
++
++/* Spare assembly buffers held per stream so MSG_END can hand the filled buffer
++ * to the reader and take a replacement without allocating in atomic context.
++ * Costs rx_asm_pool * rx_asm_max per stream (default 4 * 2 MiB = 8 MiB). The
++ * queue depth that matters is how many complete messages a reader has yet to
++ * collect, which is 1-2 in practice, not rx_queue_max. Running the pool dry is
++ * not fatal: MSG_END falls back to copying the message out, exactly as it
++ * behaved before the pool existed. */
++unsigned int odl_rx_asm_pool = 4;
++module_param_named(rx_asm_pool, odl_rx_asm_pool, uint, 0444);
++MODULE_PARM_DESC(rx_asm_pool,
++	"Spare RX assembly buffers preallocated per stream (default 4, 0 disables)");
++
+ /* Bind at most N XDomain services (0 = unlimited).  With two Thunderbolt
+  * cables both peer services sit at route=2 (BUG 2) and the handshake cannot
+  * complete; unbinding one afterwards runs the full teardown path, so bind
+diff --git a/driver/odl_tb5_proto.c b/driver/odl_tb5_proto.c
+index 62617b8..668141a 100644
+--- a/driver/odl_tb5_proto.c
++++ b/driver/odl_tb5_proto.c
+@@ -158,6 +158,25 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
+ 			dev->transport->local_tx_hopid(dev));
+ 
+ 		mutex_lock(&dev->state_lock);
++		if (dev->state == ODL_TB5_STATE_CONNECTED) {
++			/* Peer re-logged-in while our DMA verify is running.
++			 * Tearing down here aborts our verify, and with both
++			 * sides doing that the restarts phase-lock and never
++			 * converge.  Hop/hopid assignment is deterministic,
++			 * so instead: adopt the peer's (identical) hopid,
++			 * answer with our own LOGIN so the restarted peer can
++			 * complete its handshake and join verify, and let our
++			 * verify keep running.  If addressing truly changed,
++			 * verify times out and its restart path recovers. */
++			pr_info("odl_tb5: peer re-login during verify — "
++				"continuing verify, re-sending login\n");
++			dev->remote_tx_hopid = remote_tx_hopid;
++			dev->login_received = true;
++			mutex_unlock(&dev->state_lock);
++			mutex_unlock(&odl_tb5_devices_lock);
++			odl_tb5_proto_send_login(dev);
++			return 1;
++		}
+ 		if (dev->state != ODL_TB5_STATE_HANDSHAKE) {
+ 			pr_info("odl_tb5: peer restarted (our state=%d), "
+ 				"scheduling restart\n", dev->state);
+@@ -586,6 +605,17 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
+ 		       "Peer never answered the DMA ping.\n",
+ 		       attempt, dev->login_sent, dev->login_received,
+ 		       dev->remote_tx_hopid, tx_info.hop, rx_info.hop);
++		/* Parking in CONNECTED here wedges the link until a module
++		 * reload: the peer that DID reach READY has stale paths and
++		 * silently drops our traffic, and nothing ever retries.  A
++		 * full connection restart resends LOGIN, which kicks the
++		 * READY-side peer through its own restart, so both ends
++		 * re-handshake fresh and re-verify together. */
++		if (!atomic_read(&dev->removing)) {
++			pr_info("odl_tb5: scheduling connection restart "
++				"after failed DMA verify\n");
++			schedule_work(&dev->restart_work);
++		}
+ 		goto out_reset;
+ 	}
+ 
+diff --git a/driver/odl_tb5_ring_dma.c b/driver/odl_tb5_ring_dma.c
+index 61b251f..5e5e1b4 100644
+--- a/driver/odl_tb5_ring_dma.c
++++ b/driver/odl_tb5_ring_dma.c
+@@ -29,6 +29,102 @@
+ /* Forward declarations for functions defined later in this file */
+ static void odl_tb5_stream_free(struct kref *ref);
+ 
++/*
++ * ── RX assembly buffer pool ──────────────────────────────────────────────
++ *
++ * Every buffer here is odl_rx_asm_max bytes and is allocated once, in
++ * odl_tb5_stream_create(), where GFP_KERNEL may sleep, reclaim and compact.
++ *
++ * The point is what does NOT happen in the RX callback. Reassembly runs in
++ * atomic context, so it used to finish a message by asking the allocator for a
++ * multi-page block with GFP_ATOMIC -- an order-8 request for 1 MiB, which
++ * cannot reclaim and so fails on a fragmented host with gigabytes still free.
++ * That failure then delivered a short message as a complete one. Handing the
++ * filled buffer to the reader and popping a spare off this stack keeps the
++ * whole path allocation-free and copy-free.
++ *
++ * Readers push buffers back from process context while the callback pops from
++ * IRQ context, so the stack is irqsave-locked. Empty is not an error: MSG_END
++ * falls back to copying the message out.
++ */
++static void *odl_tb5_asm_pool_get(struct odl_tb5_stream *stream)
++{
++	unsigned long flags;
++	void *buf = NULL;
++
++	spin_lock_irqsave(&stream->rx_asm_pool_lock, flags);
++	if (stream->rx_asm_pool_n)
++		buf = stream->rx_asm_pool[--stream->rx_asm_pool_n];
++	spin_unlock_irqrestore(&stream->rx_asm_pool_lock, flags);
++
++	if (!buf) {
++		atomic_inc(&stream->rx_asm_pool_empty);
++		/* Greppable, because the counter is not readable from
++		 * userspace: this is the signal that MSG_END has gone back to
++		 * copying, and so back to a large GFP_ATOMIC allocation that
++		 * can fail. Steady state should never print this. */
++		pr_warn_ratelimited("odl_tb5: stream %u rx_asm pool empty (%d) - MSG_END falling back to copy\n",
++				    stream->id,
++				    atomic_read(&stream->rx_asm_pool_empty));
++	}
++	return buf;
++}
++
++static void odl_tb5_asm_pool_put(struct odl_tb5_stream *stream, void *buf)
++{
++	unsigned long flags;
++	bool stored = false;
++
++	if (!buf)
++		return;
++
++	spin_lock_irqsave(&stream->rx_asm_pool_lock, flags);
++	if (stream->rx_asm_pool_n < stream->rx_asm_pool_cap) {
++		stream->rx_asm_pool[stream->rx_asm_pool_n++] = buf;
++		stored = true;
++	}
++	spin_unlock_irqrestore(&stream->rx_asm_pool_lock, flags);
++
++	/* Cannot happen while the pool owns a fixed number of buffers, but
++	 * leaking one would be worse than the free. */
++	if (!stored)
++		kvfree(buf);
++}
++
++/* Free every buffer the pool still holds, plus the pointer array. Any buffer
++ * currently out with a reader is released by odl_tb5_rx_msg_free() instead --
++ * stream teardown drains rx_queue before calling this. */
++static void odl_tb5_asm_pool_destroy(struct odl_tb5_stream *stream)
++{
++	unsigned int i;
++
++	if (!stream->rx_asm_pool)
++		return;
++	for (i = 0; i < stream->rx_asm_pool_n; i++)
++		kvfree(stream->rx_asm_pool[i]);
++	kfree(stream->rx_asm_pool);
++	stream->rx_asm_pool = NULL;
++	stream->rx_asm_pool_n = 0;
++	stream->rx_asm_pool_cap = 0;
++}
++
++/* Release one received message. ->data is either a pool buffer handed over
++ * whole or a kmalloc'd copy from the fallback path, and the two need different
++ * allocators -- which is what ->data_from_pool records. */
++static void odl_tb5_rx_msg_free(struct odl_tb5_stream *stream,
++				struct odl_tb5_rx_msg *rxm)
++{
++	if (!rxm)
++		return;
++	if (rxm->data) {
++		if (rxm->data_from_pool)
++			odl_tb5_asm_pool_put(stream, rxm->data);
++		else
++			kfree(rxm->data);
++	}
++	kfree(rxm);
++}
++
+ /*
+  * High-resolution fallback poll timer — kicks both TX and RX ring_work
+  * every ODL_TB5_POLL_INTERVAL_NS (the comment previously said 50 us; the
+@@ -318,10 +414,9 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+ 
+ 						/* Start of new message — reset assembly */
+ 						if (flags & ODL_TB5_SHDR_F_MSG_START) {
+-							kfree(stream->rx_asm_buf);
+-							stream->rx_asm_buf = NULL;
++							/* The buffer is preallocated and persists for the
++							 * life of the stream; only the fill state resets. */
+ 							stream->rx_asm_len = 0;
+-							stream->rx_asm_cap = 0;
+ 							stream->rx_asm_src_id = shdr->src_id;
+ 							stream->rx_asm_next_frag = 0;
+ 							stream->rx_asm_bad = false;
+@@ -363,29 +458,10 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+ 						}
+ 						stream->rx_asm_next_frag = fidx + 1;
+ 
+-						/* Append payload to assembly buffer */
+-						if (stream->rx_asm_len + payload_len >
+-						    stream->rx_asm_cap) {
+-							size_t new_cap = max_t(size_t,
+-								8192,
+-								max(stream->rx_asm_cap * 2,
+-								    stream->rx_asm_len +
+-								    payload_len));
+-							void *nb = kmalloc(new_cap,
+-									   GFP_ATOMIC);
+-							if (!nb)
+-								pr_warn_ratelimited("odl_tb5: rx_asm kmalloc(%zu, GFP_ATOMIC) FAILED - payload will be dropped\n",
+-										    new_cap);
+-							if (nb) {
+-								if (stream->rx_asm_buf)
+-									memcpy(nb,
+-									       stream->rx_asm_buf,
+-									       stream->rx_asm_len);
+-								kfree(stream->rx_asm_buf);
+-								stream->rx_asm_buf = nb;
+-								stream->rx_asm_cap = new_cap;
+-							}
+-						}
++						/* Append. The buffer never grows: it was sized once at
++						 * stream creation, in a context that could reclaim. An
++						 * oversized message falls into the drop path below and is
++						 * refused, rather than assembled short. */
+ 						if (stream->rx_asm_buf &&
+ 						    stream->rx_asm_len + payload_len <=
+ 						    stream->rx_asm_cap) {
+@@ -399,19 +475,28 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+ 									    stream->rx_asm_len,
+ 									    stream->rx_asm_cap,
+ 									    stream->rx_asm_buf);
++							/* The message now has a hole in it. Mark it bad so
++							 * MSG_END discards it instead of delivering a
++							 * silently truncated buffer: to the caller a short
++							 * payload is not a lost message, it is wrong data
++							 * that looks valid. RCCL then sees a transport
++							 * error rather than a corrupted collective, which
++							 * is the difference between a visible failure and
++							 * a model that answers a question nobody asked. */
++							stream->rx_asm_bad = true;
++							atomic_inc(&stream->rx_frag_drops);
+ 						}
+ 
+ 						/* End of message — enqueue complete msg */
+ 						if (flags & ODL_TB5_SHDR_F_MSG_END) {
+ 							struct odl_tb5_rx_msg *rxm;
+ 							unsigned long rxflags;
++							void *spare;
+ 
+ 							if (stream->rx_asm_bad) {
+-								/* Incomplete: never deliver it. */
+-								kfree(stream->rx_asm_buf);
+-								stream->rx_asm_buf = NULL;
++								/* Incomplete: never deliver it. Keep the
++								 * preallocated buffer; drop the content only. */
+ 								stream->rx_asm_len = 0;
+-								stream->rx_asm_cap = 0;
+ 								stream->rx_asm_bad = false;
+ 								stream->rx_asm_next_frag = 0;
+ 								goto rx_frame_done;
+@@ -419,8 +504,32 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+ 
+ 							rxm = kzalloc(sizeof(*rxm),
+ 								      GFP_ATOMIC);
+-							if (rxm && stream->rx_asm_buf) {
++							/* Hand the filled buffer to the reader and
++							 * take a spare in its place: the delivery path
++							 * then does no allocation and no copy at all.
++							 *
++							 * If the pool is dry -- a reader that has
++							 * stopped collecting -- fall back to copying
++							 * the message out. That is the old behaviour
++							 * and can still fail here, but it is now the
++							 * rare case rather than every message, and a
++							 * failure discards the message cleanly instead
++							 * of delivering it short. */
++							spare = (rxm && stream->rx_asm_buf) ?
++								odl_tb5_asm_pool_get(stream) : NULL;
++							if (spare) {
+ 								rxm->data = stream->rx_asm_buf;
++								rxm->data_from_pool = true;
++								stream->rx_asm_buf = spare;
++							} else if (rxm && stream->rx_asm_buf) {
++								rxm->data = kmalloc(stream->rx_asm_len,
++										    GFP_ATOMIC);
++								if (rxm->data)
++									memcpy(rxm->data,
++									       stream->rx_asm_buf,
++									       stream->rx_asm_len);
++							}
++							if (rxm && rxm->data) {
+ 								rxm->len = stream->rx_asm_len;
+ 								rxm->src_id =
+ 									stream->rx_asm_src_id;
+@@ -447,21 +556,17 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
+ 									spin_unlock_irqrestore(
+ 										&stream->rx_lock,
+ 										rxflags);
+-									kfree(rxm->data);
+-									kfree(rxm);
++									odl_tb5_rx_msg_free(stream, rxm);
+ 								}
+ 
+-								/* Buffer ownership transferred
+-								 * to rx_msg (or freed above) */
+-								stream->rx_asm_buf = NULL;
++								/* The assembly buffer stays; only the
++								 * fill state resets. */
+ 								stream->rx_asm_len = 0;
+-								stream->rx_asm_cap = 0;
+ 							} else {
+-								kfree(rxm);
+-								kfree(stream->rx_asm_buf);
+-								stream->rx_asm_buf = NULL;
++								/* No buffer to deliver in -- discard
++								 * rather than deliver a partial message. */
++								odl_tb5_rx_msg_free(stream, rxm);
+ 								stream->rx_asm_len = 0;
+-								stream->rx_asm_cap = 0;
+ 							}
+ 						}
+ 
+@@ -1297,11 +1402,13 @@ static void odl_tb5_stream_free(struct kref *ref)
+ 
+ 	list_for_each_entry_safe(rx, rx_tmp, &stream->rx_queue, list) {
+ 		list_del(&rx->list);
+-		kfree(rx->data);
+-		kfree(rx);
++		/* Puts pool buffers back before the pool itself is torn down;
++		 * a plain kfree() here would free kvmalloc memory. */
++		odl_tb5_rx_msg_free(stream, rx);
+ 	}
+ 
+-	kfree(stream->rx_asm_buf);
++	odl_tb5_asm_pool_destroy(stream);
++	kvfree(stream->rx_asm_buf);
+ 
+ 	/*
+ 	 * NOT kfree(). odl_tb5_stream_lookup() walks the stream hash inside
+@@ -1329,21 +1436,73 @@ struct odl_tb5_stream *odl_tb5_stream_create(struct odl_tb5_device *dev,
+ 	if (!stream)
+ 		return ERR_PTR(-ENOMEM);
+ 
++	/* Preallocate the RX assembly buffer HERE, in process context,
++	 * where the allocator may sleep, reclaim and compact. Growing it
++	 * from the RX callback instead meant a kmalloc(GFP_ATOMIC) of the
++	 * next power of two -- order-8 for 1 MiB -- which fails on a
++	 * fragmented host even with gigabytes free, and whose failure
++	 * silently truncated the message.
++	 *
++	 * kvmalloc: this buffer is only ever memcpy'd into and copied out
++	 * of, never DMA'd, so it does not need to be physically
++	 * contiguous and can fall back to vmalloc. */
++	stream->rx_asm_buf = kvmalloc(odl_rx_asm_max, GFP_KERNEL);
++	if (!stream->rx_asm_buf) {
++		kfree(stream);
++		return ERR_PTR(-ENOMEM);
++	}
++	stream->rx_asm_cap = odl_rx_asm_max;
++
++	/* Spares for the delivery handoff, so MSG_END never allocates. Short
++	 * counts are survivable -- the pool only has to cover messages the
++	 * reader has not collected yet -- so take what we can get and let
++	 * MSG_END fall back to copying if it runs dry. */
++	spin_lock_init(&stream->rx_asm_pool_lock);
++	atomic_set(&stream->rx_asm_pool_empty, 0);
++	if (odl_rx_asm_pool) {
++		stream->rx_asm_pool = kcalloc(odl_rx_asm_pool,
++					      sizeof(*stream->rx_asm_pool),
++					      GFP_KERNEL);
++		if (stream->rx_asm_pool) {
++			unsigned int i;
++
++			stream->rx_asm_pool_cap = odl_rx_asm_pool;
++			for (i = 0; i < odl_rx_asm_pool; i++) {
++				void *b = kvmalloc(odl_rx_asm_max, GFP_KERNEL);
++
++				if (!b)
++					break;
++				stream->rx_asm_pool[stream->rx_asm_pool_n++] = b;
++			}
++			if (stream->rx_asm_pool_n < odl_rx_asm_pool)
++				pr_warn("odl_tb5: stream rx_asm pool short: %u/%u buffers\n",
++					stream->rx_asm_pool_n, odl_rx_asm_pool);
++		} else {
++			pr_warn("odl_tb5: stream rx_asm pool unavailable; MSG_END will copy\n");
++		}
++	}
++
+ 	if (filter_id == 0) {
+ 		id = ida_alloc_range(&dev->stream_ida, 20, 255, GFP_KERNEL);
+ 		if (id < 0) {
++			odl_tb5_asm_pool_destroy(stream);
++			kvfree(stream->rx_asm_buf);
+ 			kfree(stream);
+ 			return ERR_PTR(id);
+ 		}
+ 		stream->id = (u8)id;
+ 	} else {
+ 		if (filter_id < 1) {
++			odl_tb5_asm_pool_destroy(stream);
++			kvfree(stream->rx_asm_buf);
+ 			kfree(stream);
+ 			return ERR_PTR(-EINVAL);
+ 		}
+ 		id = ida_alloc_range(&dev->stream_ida,
+ 				     filter_id, filter_id, GFP_KERNEL);
+ 		if (id < 0) {
++			odl_tb5_asm_pool_destroy(stream);
++			kvfree(stream->rx_asm_buf);
+ 			kfree(stream);
+ 			return ERR_PTR(id);
+ 		}
+@@ -2046,8 +2205,9 @@ int odl_tb5_stream_recv(struct odl_tb5_stream *stream,
+ 	if (copy_to_user(buf, msg->data, *actual_len))
+ 		ret = -EFAULT;
+ 
+-	kfree(msg->data);
+-	kfree(msg);
++	/* The recycle point: a handed-over assembly buffer goes back to the
++	 * pool here, which is what keeps MSG_END allocation-free. */
++	odl_tb5_rx_msg_free(stream, msg);
+ 	return ret;
+ }
+ 
+diff --git a/rccl/src/odl_tb5_plugin.c b/rccl/src/odl_tb5_plugin.c
+index 1a8ab25..f6d02ae 100644
+--- a/rccl/src/odl_tb5_plugin.c
++++ b/rccl/src/odl_tb5_plugin.c
+@@ -257,13 +257,12 @@ static rcclResult_t odl_tb5_init(rcclDebugLogger_t logFunction)
+ 	odl_scan_devices();
+ 	/* One-line confirmation so logs prove the fast path is active
+ 	 * (silent Socket fallback is the #1 footgun — issue #23). */
+-	if (odl_logger)
+-		odl_logger(3 /* INFO */,
+-			   "ODL_TB5 net plugin loaded (%d device(s); use NET/ODL_TB5, not Socket)",
+-			   num_devices);
+-	else
+-		fprintf(stderr, "NCCL INFO ODL_TB5 net plugin loaded (%d device(s))\n",
+-			num_devices);
++	/* Do NOT call odl_logger by hand here: ncclDebugLogger_t takes
++	 * (level, flags, file, line, fmt, ...) and the old 2-arg call made
++	 * RCCL deref the device count as a filename pointer -- instant
++	 * SIGSEGV inside ncclDebugLog when a real logger is wired in. */
++	fprintf(stderr, "NCCL INFO ODL_TB5 net plugin loaded (%d device(s); use NET/ODL_TB5, not Socket)\n",
++		num_devices);
+ 	if (num_devices == 0)
+ 		WARN("no /dev/odl_tb5_* — reporting 0 devices. "
+ 		     "Load odl_tb5 on both machines and wait for "

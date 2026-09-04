@@ -1,0 +1,71 @@
+"""odl_ar2.py — python wrapper for libodl_ar2.so (2-rank all-reduce over the
+OdinLink stream API).
+
+Enqueue model: odl2_enqueue puts [stage copy] -> [doorbell] ->
+[wait+add] on the current stream and returns; a CPU progress thread moves the
+data over /dev/odl_tb5_<idx>. Rendezvous roles: (rank1
+listens, rank0 connects out), so peer_ip must be rank1's reachable IP.
+"""
+import ctypes
+import os
+
+import torch
+
+_LIB_PATHS = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "libodl_ar2.so"),
+    "/opt/venv/lib64/python3.12/site-packages/libodl_ar2.so",
+    os.path.expanduser("~/odl-ar2/libodl_ar2.so"),
+]
+
+RANK1_IP = os.environ.get("ODL2_RANK1_IP", "192.168.100.2")
+PORT = int(os.environ.get("ODL2_PORT", "18541"))
+DEV = int(os.environ.get("ODL2_DEV", "0"))
+
+_DTYPE = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}
+
+
+class OdlAllReduce2:
+    def __init__(self, rank: int, peer_ip: str = RANK1_IP, port: int = PORT,
+                 dev: int = DEV):
+        lib = None
+        for p in _LIB_PATHS:
+            if os.path.exists(p):
+                lib = ctypes.CDLL(p)
+                break
+        if lib is None:
+            raise RuntimeError("libodl_ar2.so not found")
+        lib.odl2_init.argtypes = [ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_char_p, ctypes.c_int]
+        lib.odl2_enqueue.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                     ctypes.c_void_p, ctypes.c_uint32,
+                                     ctypes.c_int]
+        lib.odl2_last_error.restype = ctypes.c_int
+        lib.odl2_max_bytes.restype = ctypes.c_uint32
+        if lib.odl2_init(rank, dev, peer_ip.encode(), port) != 0:
+            raise RuntimeError("odl2_init failed")
+        self._lib = lib
+        self.max_bytes = lib.odl2_max_bytes()
+
+    def eligible(self, t: torch.Tensor) -> bool:
+        return (
+            t.is_cuda
+            and t.is_contiguous()
+            and t.dtype in _DTYPE
+            and t.numel() * t.element_size() <= self.max_bytes
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def all_reduce_out(self, inp: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Out-of-place SUM all-reduce: out = inp + peer(inp). Stream-async."""
+        nbytes = inp.numel() * inp.element_size()
+        if self._lib.odl2_last_error():
+            raise RuntimeError("odl_ar2: latched error from a prior round")
+        stream = torch.cuda.current_stream().cuda_stream
+        rc = self._lib.odl2_enqueue(
+            ctypes.c_void_p(stream),
+            ctypes.c_void_p(out.data_ptr()),
+            ctypes.c_void_p(inp.data_ptr()),
+            nbytes, _DTYPE[inp.dtype])
+        if rc != 0:
+            raise RuntimeError(f"odl2_enqueue failed: {rc}")
+        return out

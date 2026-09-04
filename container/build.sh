@@ -2,7 +2,7 @@
 # Rebuild the DeepSeek-V4-Flash patched vLLM image from the kyuz0 gfx1151 base.
 # The base (~35 GB) is pulled on first build if not already present locally.
 set -euo pipefail
-cd "$(dirname "$0")/.."   # build context = repo root (Dockerfile needs tbv/tbv-provider)
+cd "$(dirname "$0")/.."   # build context = repo root (Dockerfile needs odinlink/)
 
 TAG="${1:-ds4-vllm-patched:local}"
 
@@ -24,7 +24,7 @@ echo
 echo ">> Built $TAG"
 echo
 echo "Sanity-check the patched files landed:"
-echo "  podman run --rm $TAG ls -la /opt/venv/lib/python3.12/site-packages/tbv_ar2.py \\"
+echo "  podman run --rm $TAG ls -la /opt/venv/lib/python3.12/site-packages/odl_ar2.py \\"
 echo "                              /opt/venv/lib/python3.12/site-packages/ds4_tl_indexer.py"
 echo
 echo "Then create the serving distrobox (named per ds4-config.yaml, default 'vllm'):"

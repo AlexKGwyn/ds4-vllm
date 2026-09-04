@@ -1,0 +1,18 @@
+[Unit]
+Description=OdinLink transport for the DS4 dual-node cluster
+After=network.target
+Before=ds4-vllm.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=ODL_KO=/usr/local/lib/odinlink/odl_tb5.ko
+Environment=ODL_UDEV_RULE=/usr/local/share/odinlink/71-odl-tb5.rules
+Environment=ODL_STATE=/usr/local/bin/odl-state
+ExecStart=/usr/local/sbin/odl-swap.sh
+ExecStop=/usr/sbin/rmmod odl_tb5
+TimeoutStartSec=2min
+TimeoutStopSec=1min
+
+[Install]
+WantedBy=multi-user.target

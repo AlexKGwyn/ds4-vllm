@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Production vLLM launcher (512K ctx + MTP, RDMA). Run INSIDE the vllm container;
-# started by the ds4-vllm-manual systemd user unit. Sources the canonical RDMA
+# started by ds4-cluster-restart.sh (ds4-serve.sh start). Sources the canonical
 # cluster-env, then execs vllm serve on api_port from ds4-config.yaml.
 #
 # THIS FILE IS THE SOURCE OF TRUTH -- copy it to the serve user's home before
@@ -23,7 +23,7 @@
 # a '#' there silently comments out every remaining argument, and `bash -n`
 # still reports the file as valid.
 set -u
-source "$HOME/ds4-cluster-env.${DS4_TRANSPORT:-rdma}.sh"
+source "$HOME/ds4-cluster-env.${DS4_TRANSPORT:-odl}.sh"
 
 # NVMe KV cache (fs_lru tier), ON by default. Prefix blocks evicted from GPU
 # are kept on node-local disk and reloaded instead of re-prefilled, and the
@@ -108,11 +108,47 @@ if [ "$DS4_DISK_KV" = "1" ]; then
   echo "[manual-serve] disk KV ON: dir=$KVDIR cap=${DS4_DISK_KV_BYTES:-32212254720} cpu=${DS4_DISK_KV_CPU_BYTES:-4294967296}"
 fi
 
+# Decode runs with breakable (PIECEWISE) cudagraphs. Three things make this
+# correct on gfx1151; all three live in the patched engine
+# (container/patches/vllm-upstream.patch):
+#   1. VLLM_USE_BREAKABLE_CUDAGRAPH=1 exported in ds4-cluster-env.sh so the
+#      prestarted Ray workers see it at import time. Without it the
+#      eager-break decorator strips itself in the workers and the capture
+#      silently degrades to one monolithic graph with host-side attention
+#      metadata baked in (deterministic garbage on replay). The patched
+#      decorator also checks at call time as a backstop.
+#   2. Padding-row zeroing after each replayed eager segment: eager ops
+#      write only the valid rows of their in-place outputs, and NaN pool
+#      garbage in the padding rows otherwise poisons the whole batch
+#      through row-mixing fp8-quant reductions in the next graph segment.
+#   3. The TP all-reduce is a functional eager break: odl_ar2 refuses to
+#      run during stream capture, so capturing it would bake the RCCL
+#      fallback into every replay.
+# The capture sizes cover the MTP-5 decode shapes (6*num_seqs) exactly;
+# padded replays are correct but slower. The speculative config's
+# "enforce_eager":true is LOAD-BEARING and must stay: the DSpark drafter
+# cannot be captured by the runner's wrapper (its replay-marker test is a
+# blocking D2H, illegal during capture) and manages its own step-0 graphs
+# instead (DS4_MTP_CUDAGRAPH, default on).
+SPEC_ARGS=()
+if (( ${DS4_SPEC_TOKENS:-5} > 0 )); then
+  if [ "${DS4_ASYNC_SCHED:-1}" = "1" ]; then
+    # Async scheduling (overlaps scheduler/output host work with the GPU
+    # step) requires PADDED drafter batches -- every sequence hands the
+    # drafter all num_spec+1 rows and the proposer names the last ACCEPTED
+    # row via token_indices_to_sample (the DSpark wrapper drafts at those
+    # anchors; set_anchor_indices). enforce_eager stays: the drafter's
+    # self-managed step-0 graphs remain the capture path.
+    # DS4_ASYNC_SCHED=0 restores the unpadded/sync configuration.
+    SPEC_ARGS=(--speculative-config "{\"method\":\"deepseek_mtp\",\"num_speculative_tokens\":${DS4_SPEC_TOKENS:-5},\"disable_padded_drafter_batch\":false,\"enforce_eager\":true}" --async-scheduling)
+  else
+    SPEC_ARGS=(--speculative-config "{\"method\":\"deepseek_mtp\",\"num_speculative_tokens\":${DS4_SPEC_TOKENS:-5},\"disable_padded_drafter_batch\":true,\"enforce_eager\":true}")
+  fi
+fi
 exec vllm serve "${DS4_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}" \
   --served-model-name deepseek-v4-flash \
   --tensor-parallel-size 2 \
   --distributed-executor-backend ray \
-  --enforce-eager \
   --kv-cache-dtype fp8 \
   --gpu-memory-utilization ${DS4_GPU_UTIL:-0.83} \
   --kv-cache-memory-bytes ${DS4_KV_BYTES:-6442450944} \
@@ -122,9 +158,11 @@ exec vllm serve "${DS4_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}" \
   --tokenizer-mode deepseek_v4 \
   --reasoning-parser deepseek_v4 \
   --default-chat-template-kwargs '{"thinking":true,"reasoning_effort":"high"}' \
+  -cc.cudagraph_mode=PIECEWISE \
+  -cc.cudagraph_capture_sizes='[1,2,4,6,8,12,16,18,24,32,48,64]' \
   --override-generation-config '{"temperature":1.0,"top_p":1.0}' \
   --enable-auto-tool-choice \
   --tool-call-parser deepseek_v4 \
-  --speculative-config '{"method":"deepseek_mtp","num_speculative_tokens":5,"disable_padded_drafter_batch":true,"enforce_eager":true}' \
+  "${SPEC_ARGS[@]}" \
   "${OFFLOAD[@]}" \
   --host 127.0.0.1 --port "${DS4_API_PORT:-1234}"
