@@ -3,10 +3,10 @@
 All changes are a single overlay on the **`kyuz0/vllm-therock-gfx1151`** base
 (pinned digest `sha256:25fd294f…`, which ships vLLM commit **`470229c`**).
 
-- **37 modified** files — shipped as `vllm-upstream.patch` in this folder, applied
+- **41 modified** files — shipped as `vllm-upstream.patch` in this folder, applied
   to the base's own sources at image build (base → patched). The diffs double as
   review material: a reader can see exactly what changed versus upstream.
-- **18 new** files — added by the patch set; no diff (whole file is new). Their
+- **21 new** files — added by the patch set; no diff (whole file is new). Their
   final form is in `../rootfs`, which the Dockerfile overlays after patching.
 - 1 file (`aiter_meta/csrc/cpp_itfs/utils.py`) was flagged changed by the image
   layer but is **byte-identical** to the base (metadata-only touch) and is
@@ -20,13 +20,19 @@ modules and the aiter config).
 | file | Δ | purpose |
 |---|---|---|
 | `vllm/models/deepseek_v4/__init__.py` | +1/-1 | model registration |
-| `vllm/models/deepseek_v4/amd/model.py` | +86/-4 | AMD DSpark model wiring (custom all-reduce hook, layer glue); folds the decode layer's `attn_norm`/`ffn_norm` RMSNorms into the mhc kernels' `layer_input` write (kernel support pre-existed, was never wired), dropping two standalone norm kernels per layer |
-| `vllm/models/deepseek_v4/amd/rocm.py` | +67 | ROCm-specific op paths; `DS4_FUSE_RAGGED` single-kernel decode topk ragged build |
-| `vllm/models/deepseek_v4/amd/dspark_mtp.py` | **new (1485)** | DSpark Multi-Token-Prediction (MTP) drafter: fast-replay contract, self-managed step-0 draft CUDA graphs (`DS4_MTP_CUDAGRAPH`), fused in-graph glue (`DS4_MTP_FUSE_GLUE`), vocab-sharded markov chain + distributed argmax (`DS4_MTP_VOCAB_SHARD`) |
+| `vllm/models/deepseek_v4/amd/model.py` | +110/-4 | AMD DSpark model wiring (custom all-reduce hook, layer glue); folds the decode layer's `attn_norm`/`ffn_norm` RMSNorms into the mhc kernels' `layer_input` write (kernel support pre-existed, was never wired), dropping two standalone norm kernels per layer; Vision-Exp `bias_vl` (visual expert selection bias) registration, hash-layer bias skipping on load, and handoff to the router |
+| `vllm/models/deepseek_v4/amd/rocm.py` | +118/-4 | ROCm-specific op paths; `DS4_FUSE_RAGGED` single-kernel decode topk ragged build; the sparse-SWA prefill combine kernel takes per-token image-span visibility from the Vision-Exp wrapper (bidirectional attention within `[IMAGE_START..IMAGE_END]`, reference `get_window_topk_idxs_visible` semantics; text tokens keep the exact causal window) |
+| `vllm/models/deepseek_v4/amd/dspark_mtp.py` | **new (1488)** | DSpark Multi-Token-Prediction (MTP) drafter: fast-replay contract, self-managed step-0 draft CUDA graphs (`DS4_MTP_CUDAGRAPH`), fused in-graph glue (`DS4_MTP_FUSE_GLUE`), vocab-sharded markov chain + distributed argmax (`DS4_MTP_VOCAB_SHARD`) |
+| `vllm/models/deepseek_v4/mm_preprocess.py` | **new (320)** | DeepSeek-V4-Flash-Vision-Exp image resize/grid/C4 token preprocessing and the multimodal processor (selected when the checkpoint config declares `vision_n_layers`) |
+| `vllm/models/deepseek_v4/vision.py` | **new (148)** | Vision-Exp BF16 vision tower and image-to-language aligner |
+| `vllm/models/deepseek_v4/vision_model.py` | **new (171)** | `DeepseekV4VForConditionalGeneration`: the multimodal wrapper around the text model (weight mapping, sentinel-block embedding merge, per-token image-span visibility for the attention kernel, DSpark stash delegation for MTP) |
 | `vllm/models/deepseek_v4/attention.py` | +32/-4 | MLA / sparse-attention wiring |
 | `vllm/models/deepseek_v4/common/ops/cache_utils.py` | +43 | KV-cache helpers (fp8_ds_mla latents) |
 | `vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py` | +101/-40 | fused compress+quant of the MLA KV latent (UE8M0 fp8) |
 | `vllm/models/deepseek_v4/common/ops/fused_indexer_q.py` | +82 | indexer-Q quantization (Hadamard128 + FP4 QAT) |
+| `vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py` | +51/-4 | Vision-Exp expert routing: select the text or visual expert correction bias per token, substitute a text id for image sentinels before hash-table routing, and use the exact torch selector for the per-token-bias case (the fused gfx1151 selector takes one bias vector); text-only models keep the fused path untouched |
+| `vllm/model_executor/models/registry.py` | +6 | register `DeepseekV4VForConditionalGeneration` (the Vision-Exp checkpoint still declares the text architecture, so it is selected by `--hf-overrides`) |
+| `vllm/v1/engine/input_processor.py` | +8/-1 | admit the five Vision-Exp out-of-vocabulary image sentinel ids when a vision tower is configured |
 
 ## Sparse indexer / mid-context retrieval
 | file | Δ | purpose |
@@ -78,6 +84,7 @@ modules and the aiter config).
 | `vllm/v1/worker/gpu_model_runner.py` | +8 | model-runner hook |
 | `vllm/compilation/breakable_cudagraph.py` | +147/-5 | piecewise cudagraph, keeps attention + custom all-reduce eager; call-time (not import-time) enable gating for prestarted workers, padding-row zeroing after replayed eager segments, functional eager break for out-of-place ops |
 | `vllm/v1/spec_decode/llm_base_proposer.py` | +99/-6 | MTP proposer adjustment; `DS4_MTP_FAST_REPLAY` skips dead per-iteration work for stash-style drafters; hands the DSpark drafter its anchors (`set_anchor_indices`) for padded drafter batches |
+| `vllm/config/speculative.py` | +10/-1 | declare `n_predict=1` for every deepseek_v4 draft config: the DSpark drafter is one predictor with three internal stages, and the draft config is loaded fresh so a target `--hf-overrides` cannot reach it -- Vision-Exp's declared 3 would otherwise reject MTP-5 at boot |
 
 ## Disk KV cache (`fs_lru`, distributed)
 | file | Δ | purpose |

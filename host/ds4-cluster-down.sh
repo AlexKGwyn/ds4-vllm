@@ -23,7 +23,7 @@ rm -f "$PIDFILE"
 sleep 2
 
 # The bracket keeps this grep from matching its own command line.
-for p in $(ps -eo pid,cmd --no-headers | grep "bin/[v]llm serve deepseek" | awk '{print $1}'); do
+for p in $(ps -eo pid,cmd --no-headers | grep "bin/[v]llm serve" | awk '{print $1}'); do
   echo "[cluster-down] reaping vllm serve pid=$p"
   kill "$p" 2>/dev/null; sleep 3
   kill -0 "$p" 2>/dev/null && { kill -9 "$p" 2>/dev/null; sleep 2; }

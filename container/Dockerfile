@@ -4,7 +4,7 @@
 # TheRock/ROCm gfx1151 base image — the exact base the patches were developed
 # against. The base already contains the full ROCm 7 + PyTorch + vLLM build
 # (vLLM commit 470229c); this file applies the DeepSeek-V4 / DSpark patch
-# (patches/vllm-upstream.patch, 37 files), overlays the 18 new files from
+# (patches/vllm-upstream.patch, 41 files), overlays the 21 new files from
 # ./rootfs, builds the OdinLink userspace (the RCCL net plugin and the odl_ar2
 # all-reduce) and the hand-written decode kernels, and rebuilds ROCr. Third-party sources are FETCHED at pinned
 # commits, not vendored (network needed on first build).
@@ -82,8 +82,8 @@ RUN git clone https://github.com/Geramy/OdinLink-Five /tmp/odinlink && \
 
 FROM ${DS4_BASE}
 
-# Apply the vLLM patch-set to the base's own sources (37 files), then overlay
-# the 18 new files from rootfs/ (which mirrors "/"). The patch is the same
+# Apply the vLLM patch-set to the base's own sources (41 files), then overlay
+# the 21 new files from rootfs/ (which mirrors "/"). The patch is the same
 # reviewable diff in patches/; container/verify-patches.sh proves it applies.
 COPY container/patches/vllm-upstream.patch /tmp/
 RUN cd / && git apply -p1 --whitespace=nowarn /tmp/vllm-upstream.patch && rm /tmp/vllm-upstream.patch

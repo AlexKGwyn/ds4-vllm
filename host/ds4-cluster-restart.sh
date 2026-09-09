@@ -75,12 +75,12 @@ rm -f "$PIDFILE"
 sleep 4
 
 # The bracket keeps this grep from matching its own command line.
-for p in $(ps -eo pid,cmd --no-headers | grep "bin/[v]llm serve deepseek" | awk '{print $1}'); do
+for p in $(ps -eo pid,cmd --no-headers | grep "bin/[v]llm serve" | awk '{print $1}'); do
   echo "   reaping stranded vllm serve pid=$p"
   kill "$p" 2>/dev/null; sleep 3
   kill -0 "$p" 2>/dev/null && { kill -9 "$p" 2>/dev/null; sleep 2; }
 done
-residual=$(ps -eo cmd --no-headers | grep -c "bin/[v]llm serve deepseek")
+residual=$(ps -eo cmd --no-headers | grep -c "bin/[v]llm serve")
 [ "$residual" -eq 0 ] || { echo "!! $residual vllm serve process(es) still alive -- aborting"; exit 1; }
 
 inbox 'ray stop --force >/dev/null 2>&1' >/dev/null 2>&1
@@ -168,6 +168,6 @@ else
   rdma=$(grep -aoE "odl_ar2: rank[0-9] ready[^\"]*" "$SERVE_LOG" 2>/dev/null | head -1)
   echo "   fast AR: ${rdma:-!! odl_ar2 NOT ready -- decode all-reduce is on the slow path}"
 fi
-echo "   vllm serve procs: $(ps -eo cmd --no-headers | grep -c 'bin/[v]llm serve deepseek') (want 1)"
+echo "   vllm serve procs: $(ps -eo cmd --no-headers | grep -c 'bin/[v]llm serve') (want 1)"
 echo "   ray idle workers: $(ps -eo cmd --no-headers | grep -c '[r]ay::IDLE')"
 echo "   MemAvailable: $(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo)MB"

@@ -41,7 +41,9 @@ Three independent layers, build/verify them in this order:
   `podman`, `distrobox`, `git`, build toolchain. A stock kernel is fine —
   nothing here needs a patched thunderbolt core.
 - The model weights **`deepseek-ai/DeepSeek-V4-Flash-0731`** (~150 GB) downloaded
-  on **both** boxes (`hf download deepseek-ai/DeepSeek-V4-Flash-0731`).
+  on **both** boxes (`hf download deepseek-ai/DeepSeek-V4-Flash-0731`). For
+  image input, `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` instead; the
+  launcher detects a vision checkpoint from its config (README "Vision").
 - Root/sudo on both boxes (kernel modules, systemd units).
 - **Secure Boot disabled on both boxes**, unless the box has an enrolled MOK:
   `odl_tb5.ko` is built locally, and `odl-swap.sh` signs it with the enrolled
@@ -163,7 +165,8 @@ distrobox enter vllm -- ibv_devices             # gate: lists usb4_rdma0 (if §1
 
 Deploy the `host/` files per README §3 and set the site values in
 `~/ds4-config.yaml` on box1 (head/worker IPs, container name, `transport:
-rdma|tcp|odl`, RDMA HCA pin, disk KV). Two rules that bite:
+rdma|tcp|odl`, RDMA HCA pin, disk KV; `model:` set to the Vision-Exp
+checkpoint for image input). Two rules that bite:
 
 - `ds4-cluster-env*.sh` **must be byte-identical on both boxes** — the two TP
   ranks silently diverge otherwise. Copy the same files to both.

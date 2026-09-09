@@ -145,8 +145,36 @@ if (( ${DS4_SPEC_TOKENS:-5} > 0 )); then
     SPEC_ARGS=(--speculative-config "{\"method\":\"deepseek_mtp\",\"num_speculative_tokens\":${DS4_SPEC_TOKENS:-5},\"disable_padded_drafter_batch\":true,\"enforce_eager\":true}")
   fi
 fi
-exec vllm serve "${DS4_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}" \
+# Vision checkpoint detection. DeepSeek-V4-Flash-Vision-Exp's config.json
+# still declares the text architecture, so vLLM would load it text-only; the
+# marker that distinguishes it is vision_n_layers (the same key the patched
+# engine gates its vision paths on). When the checkpoint pointed at by model:
+# declares it, select the multimodal wrapper with --hf-overrides. The same
+# override declares num_nextn_predict_layers=1: Vision-Exp declares its
+# three-stage DSpark drafter as 3 where the text checkpoint declares 1, the
+# drafter is one predictor either way (the stages are internal to it), and 1
+# keeps vLLM's num_speculative_tokens check on the MTP-5 shape.
+# config.json is read from the local dir or the HF cache (a cached repo
+# resolves offline); if it cannot be read, serve as text and say so.
+MODEL=${DS4_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}
+VISION_LAYERS=$(/opt/venv/bin/python3 - "$MODEL" <<'PYEOF'
+import json, os, sys
+model = sys.argv[1]
+path = os.path.join(model, "config.json")
+if not os.path.isfile(path):
+    from huggingface_hub import hf_hub_download
+    path = hf_hub_download(model, "config.json")
+print(int(json.load(open(path)).get("vision_n_layers") or 0))
+PYEOF
+) || { echo "[manual-serve] WARNING: could not read $MODEL/config.json -- serving as a text checkpoint"; VISION_LAYERS=0; }
+HF_OVERRIDE_ARGS=()
+if [ "${VISION_LAYERS:-0}" -gt 0 ]; then
+  echo "[manual-serve] vision checkpoint (vision_n_layers=$VISION_LAYERS): serving the multimodal wrapper"
+  HF_OVERRIDE_ARGS=(--hf-overrides '{"architectures":["DeepseekV4VForConditionalGeneration"],"num_nextn_predict_layers":1}')
+fi
+exec vllm serve "$MODEL" \
   --served-model-name deepseek-v4-flash \
+  "${HF_OVERRIDE_ARGS[@]}" \
   --tensor-parallel-size 2 \
   --distributed-executor-backend ray \
   --kv-cache-dtype fp8 \
