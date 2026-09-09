@@ -35,7 +35,7 @@ export DS4_IB_AR2_HCA=${DS4_IB_AR2_HCA:-mlx4}
 
 # Live profiling: enables /start_profile & /stop_profile API endpoints; traces
 # land in ~/vllm-profiles (shared into the container). Inert unless invoked.
-export VLLM_TORCH_PROFILER_DIR=/home/alex/vllm-profiles
+export VLLM_TORCH_PROFILER_DIR=$HOME/vllm-profiles
 export VLLM_SERVER_DEV_MODE=1
 # Single-kernel tiny-batch MoE routing (5 launches -> 1; ~8ms/step CPU).
 export DS4_TINY_ROUTING=1

@@ -11,7 +11,37 @@
      from .xpu.mtp import DeepSeekV4MTP  # type: ignore[assignment]
 --- a/opt/venv/lib/python3.12/site-packages/vllm/models/deepseek_v4/amd/model.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/models/deepseek_v4/amd/model.py
-@@ -311,7 +311,12 @@
+@@ -159,6 +159,16 @@
+                 requires_grad=False,
+             )
+ 
++        # Vision-Exp carries a second selection-only expert bias. The router
++        # chooses it per image position; text positions keep the existing bias.
++        self.vl_vocab_size = config.vocab_size
++        self.gate.bias_vl = None
++        if int(getattr(config, "vision_n_layers", 0) or 0) > 0:
++            self.gate.bias_vl = nn.Parameter(
++                torch.empty(config.n_routed_experts, dtype=torch.float32),
++                requires_grad=False,
++            )
++
+         if config.n_shared_experts is None:
+             self.shared_experts = None
+         else:
+@@ -198,6 +208,12 @@
+             swiglu_limit=self.swiglu_limit,
+             router_logits_dtype=torch.float32,
+         )
++        if self.gate.bias_vl is not None:
++            # FusedMoE owns the actual router. Attach the visual bias there so
++            # its normal custom-op path can select per-token routing without
++            # replacing the DS4 expert kernels.
++            self.experts.router.vision_e_score_correction_bias = self.gate.bias_vl
++            self.experts.router.vision_vocab_size = self.vl_vocab_size
+ 
+     def forward(
+         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+@@ -311,7 +327,12 @@
          hc_fn: torch.Tensor,
          hc_scale: torch.Tensor,
          hc_base: torch.Tensor,
@@ -24,7 +54,7 @@
          post_mix, res_mix, layer_input = self.mhc_pre(
              residual=x,
              fn=hc_fn,
-@@ -322,6 +327,8 @@
+@@ -322,6 +343,8 @@
              hc_sinkhorn_eps=self.hc_eps,
              hc_post_mult_value=self.hc_post_alpha,
              sinkhorn_repeat=self.hc_sinkhorn_iters,
@@ -33,7 +63,7 @@
          )
          return layer_input, post_mix, res_mix
  
-@@ -347,7 +354,8 @@
+@@ -347,7 +370,8 @@
              # Run standalone hc_pre on first layer
              residual = x
              x, post_mix, res_mix = self.hc_pre(
@@ -43,7 +73,7 @@
              )
          else:
              residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
-@@ -363,9 +371,13 @@
+@@ -363,9 +387,13 @@
                  self.hc_eps,
                  self.hc_post_alpha,
                  self.hc_sinkhorn_iters,
@@ -58,7 +88,7 @@
          x = self.attn(positions, x, None)
  
          residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
-@@ -381,8 +393,12 @@
+@@ -381,8 +409,12 @@
              self.hc_eps,
              self.hc_post_alpha,
              self.hc_sinkhorn_iters,
@@ -72,7 +102,7 @@
          x = self.ffn(x, input_ids)
          return x, residual, post_mix, res_mix
  
-@@ -467,6 +483,21 @@
+@@ -467,6 +499,21 @@
              device=self.device,
          )
  
@@ -94,7 +124,7 @@
          if get_pp_group().is_first_rank:
              self.embed_tokens = VocabParallelEmbedding(
                  config.vocab_size,
-@@ -529,6 +560,24 @@
+@@ -529,6 +576,24 @@
              )
          else:
              self._mtp_hidden_buffer = None
@@ -119,7 +149,7 @@
  
      def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
          return self.embed_tokens(input_ids)
-@@ -571,7 +620,11 @@
+@@ -571,7 +636,11 @@
              hidden_states = intermediate_tensors["hidden_states"]
  
          residual, post_mix, res_mix = None, None, None
@@ -132,7 +162,7 @@
              hidden_states, residual, post_mix, res_mix = layer(
                  hidden_states,
                  positions,
-@@ -580,6 +633,29 @@
+@@ -580,6 +649,29 @@
                  res_mix,
                  residual,
              )
@@ -162,7 +192,7 @@
          if layer is not None and self.has_tilelang:
              hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
  
-@@ -589,6 +665,9 @@
+@@ -589,6 +681,9 @@
          # Stash pre-hc_head residual for the MTP draft (captured copy_).
          num_tokens = hidden_states.shape[0]
          self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
@@ -172,7 +202,22 @@
  
          hidden_states = self.hc_head_op(
              hidden_states,
-@@ -807,6 +886,9 @@
+@@ -690,6 +785,14 @@
+                 else:
+                     if is_pp_missing_parameter(name, self):
+                         continue
++                    # Vision-Exp serializes text/visual gate biases even for
++                    # hash-routed layers. Those layers select experts through
++                    # tid2eid and intentionally have no correction-bias param.
++                    if (
++                        name not in params_dict
++                        and name.endswith(".ffn.gate.e_score_correction_bias")
++                    ):
++                        continue
+                     param = params_dict[name]
+                     weight_loader = getattr(
+                         param, "weight_loader", default_weight_loader
+@@ -807,6 +910,9 @@
          """Pre-hc_head residual stream buffer (max_num_batched_tokens,
          hc_mult * hidden_size) for the MTP draft model. Populated by
          forward(); valid after each target step."""
@@ -207,7 +252,101 @@
  
  def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
      lengths = lengths.to(dtype=torch.int32).contiguous()
-@@ -238,6 +254,20 @@
+@@ -53,11 +69,15 @@
+     query_start_loc_ptr,
+     seq_lens_ptr,
+     gather_lens_ptr,
++    vis_left_ptr,
++    vis_right_ptr,
+     M,
+     N,
+     TOP_K: tl.constexpr,
+     COMPRESS_RATIO: tl.constexpr,
+     WINDOW_SIZE: tl.constexpr,
++    SWA_WIDTH: tl.constexpr,
++    HAS_VIS: tl.constexpr,
+     TOPK_WIDTH: tl.constexpr,
+     PADDED_TOP_K: tl.constexpr,
+ ):
+@@ -78,7 +98,22 @@
+         token_idx_in_query = token_idx - query_start
+         pos = start_pos + token_idx_in_query
+         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
+-        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
++        if HAS_VIS:
++            # Reference get_window_topk_idxs_visible: an in-span query sees
++            # forward to the span end (right) and its window start is pulled
++            # back so the span start stays visible (left_add). Clamped to the
++            # gathered SWA buffer [gather_start, seq_len). left==right==0
++            # (text tokens) reduces exactly to the causal window below.
++            vleft = tl.load(vis_left_ptr + token_idx)
++            vright = tl.load(vis_right_ptr + token_idx)
++            left_add = tl.maximum(vleft - (WINDOW_SIZE - 1), 0)
++            swa_start = tl.maximum(pos - (WINDOW_SIZE - 1) - left_add, 0)
++            swa_start = tl.maximum(swa_start, gather_start)
++            swa_end = tl.minimum(pos + vright, seq_len - 1)
++            swa_len = tl.minimum(swa_end - swa_start + 1, SWA_WIDTH)
++        else:
++            swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
++            swa_start = pos - swa_len + 1
+ 
+         topk_offset = tl.arange(0, PADDED_TOP_K)
+         topk_mask = topk_offset < topk_len
+@@ -96,13 +131,13 @@
+             mask=topk_mask,
+         )
+ 
+-        swa_offset = tl.arange(0, WINDOW_SIZE)
++        swa_offset = tl.arange(0, SWA_WIDTH)
+         tl.store(
+             combined_indices_ptr
+             + token_idx * combined_indices_stride
+             + topk_len
+             + swa_offset,
+-            M * batch_idx + N + swa_offset + pos - swa_len + 1 - gather_start,
++            M * batch_idx + N + swa_start - gather_start + swa_offset,
+             mask=swa_offset < swa_len,
+         )
+ 
+@@ -119,12 +154,20 @@
+     topk: int,
+     M: int,
+     N: int,
++    vis_left: torch.Tensor | None = None,
++    vis_right: torch.Tensor | None = None,
++    vis_extra: int = 0,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
+     num_tokens = topk_indices.shape[0]
+     num_reqs = seq_lens.shape[0]
++    # Image-span visibility widens the SWA slice by at most vis_extra
++    # (= vision_max_n_token) columns; see the width bound in the kernel
++    # comment. Text-only calls keep the exact original width and arithmetic.
++    has_vis = vis_left is not None and vis_right is not None and vis_extra > 0
++    swa_width = window_size + (vis_extra if has_vis else 0)
+     combined_topk = (
+-        (topk + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
++        (topk + swa_width + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+         // _SPARSE_PREFILL_TOPK_ALIGNMENT
+         * _SPARSE_PREFILL_TOPK_ALIGNMENT
+     )
+@@ -148,11 +191,15 @@
+         query_start_loc,
+         seq_lens,
+         gather_lens,
++        vis_left if has_vis else combined_lens,
++        vis_right if has_vis else combined_lens,
+         M,
+         N,
+         TOP_K=topk,
+         COMPRESS_RATIO=compress_ratio,
+         WINDOW_SIZE=window_size,
++        SWA_WIDTH=swa_width,
++        HAS_VIS=has_vis,
+         TOPK_WIDTH=topk_indices.shape[-1],
+         PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
+     )
+@@ -238,6 +285,20 @@
      num_tokens = topk_indices.shape[0]
      topk = topk_indices.shape[1]
  
@@ -228,7 +367,7 @@
      topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
      _compute_topk_lens_kernel[(num_tokens,)](
          topk_lens,
-@@ -713,6 +743,43 @@
+@@ -713,6 +774,43 @@
                  topk_ragged_indices = attn_metadata.c128a_decode_topk_ragged_indices
                  topk_ragged_indptr = attn_metadata.c128a_decode_topk_ragged_indptr
  
@@ -272,6 +411,36 @@
          rocm_sparse_attn_decode(
              q=q,
              kv_cache=kv_cache,
+@@ -762,6 +860,17 @@
+         assert query_start_loc is not None
+         prefill_token_base = query_start_loc_cpu[num_decodes]
+ 
++        # Image-span visibility published by the Vision-Exp wrapper for this
++        # step (absent for text-only models/steps). Rows cover the whole flat
++        # token batch, decode tokens first — slice to the prefill rows.
++        vis = getattr(get_forward_context(), "ds4_image_visibility", None)
++        vis_left = vis_right = None
++        vis_extra = 0
++        if vis is not None:
++            vis_left = vis[0][num_decode_tokens:][:num_prefill_tokens]
++            vis_right = vis[1][num_decode_tokens:][:num_prefill_tokens]
++            vis_extra = vis[2]
++
+         if not swa_only:
+             if self.compress_ratio == 4:
+                 assert self.topk_indices_buffer is not None
+@@ -836,6 +945,11 @@
+                 top_k,
+                 M,
+                 N,
++                vis_left=None if vis_left is None
++                else vis_left[query_start:query_end],
++                vis_right=None if vis_right is None
++                else vis_right[query_start:query_end],
++                vis_extra=vis_extra,
+             )
+             rocm_sparse_attn_prefill(
+                 q=q[query_start:query_end],
 --- a/opt/venv/lib/python3.12/site-packages/vllm/models/deepseek_v4/attention.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/models/deepseek_v4/attention.py
 @@ -75,6 +75,15 @@
@@ -728,6 +897,124 @@
              num_warps=1,  # TODO: Tune this
          )
      return index_q_fp8, index_weights_out
+--- a/opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py
++++ b/opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py
+@@ -168,6 +168,28 @@
+     hash_indices_table: torch.Tensor | None = None,
+     routed_scaling_factor: float = 1.0,
+ ):
++    # Vision-Exp supplies a per-token selection bias. The fused ROCm op accepts
++    # only one [experts] bias, so use the exact torch reference for this small
++    # multimodal routing case while keeping the text-only fast path untouched.
++    if (
++        scoring_func == "sqrtsoftplus"
++        and e_score_correction_bias is not None
++        and e_score_correction_bias.dim() == 2
++    ):
++        m = hidden_states.size(0)
++        topk_weights = torch.empty(
++            m, topk, dtype=torch.float32, device=hidden_states.device)
++        topk_ids = torch.empty(
++            m, topk,
++            dtype=torch.int32 if indices_type is None else indices_type,
++            device=hidden_states.device)
++        token_expert_indices = torch.empty(
++            m, topk, dtype=torch.int32, device=hidden_states.device)
++        return _topk_softplus_sqrt_torch(
++            topk_weights, topk_ids, token_expert_indices, gating_output,
++            renormalize, e_score_correction_bias, input_tokens,
++            hash_indices_table, routed_scaling_factor)
++
+     # The topk kernel dispatches dtype based on topk_ids (set by
+     # indices_type) and assumes input_tokens/hash_indices_table match.
+     if indices_type is not None:
+@@ -346,6 +368,10 @@
+         self.routed_scaling_factor = routed_scaling_factor
+         self.scoring_func = scoring_func
+         self._hash_indices_table = hash_indices_table
++        # Populated by the DeepSeek-V4 AMD model for Vision-Exp. Keeping these
++        # on the router lets the existing MoE runner retain its custom kernels.
++        self.vision_e_score_correction_bias: torch.Tensor | None = None
++        self.vision_vocab_size: int | None = None
+ 
+     @property
+     def routing_method_type(self) -> RoutingMethodType:
+@@ -367,17 +393,38 @@
+         input_ids: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """Compute routing using fused top-k with bias."""
++        selection_bias = (
++            self.e_score_correction_bias.data
++            if self.e_score_correction_bias is not None
++            else None
++        )
++        safe_input_ids = input_ids
++        if (
++            self.vision_e_score_correction_bias is not None
++            and self.vision_vocab_size is not None
++            and input_ids is not None
++        ):
++            image_mask = input_ids >= self.vision_vocab_size
++            safe_input_ids = torch.where(
++                image_mask, torch.zeros_like(input_ids), input_ids)
++            text_bias = selection_bias
++            if text_bias is None:
++                text_bias = torch.zeros_like(
++                    self.vision_e_score_correction_bias)
++            selection_bias = torch.where(
++                image_mask.unsqueeze(-1),
++                self.vision_e_score_correction_bias.unsqueeze(0),
++                text_bias.unsqueeze(0),
++            )
+         topk_weights, topk_ids = fused_topk_bias(
+             hidden_states=hidden_states,
+             gating_output=router_logits,
+             scoring_func=self.scoring_func,
+-            e_score_correction_bias=self.e_score_correction_bias.data
+-            if self.e_score_correction_bias is not None
+-            else None,
++            e_score_correction_bias=selection_bias,
+             topk=self.top_k,
+             renormalize=self.renormalize,
+             indices_type=indices_type,
+-            input_tokens=input_ids,
++            input_tokens=safe_input_ids,
+             hash_indices_table=self._hash_indices_table,
+             routed_scaling_factor=self.routed_scaling_factor,
+         )
+--- a/opt/venv/lib/python3.12/site-packages/vllm/model_executor/models/registry.py
++++ b/opt/venv/lib/python3.12/site-packages/vllm/model_executor/models/registry.py
+@@ -99,6 +99,12 @@
+     "DeepseekV3ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
+     "DeepseekV32ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
+     "DeepseekV4ForCausalLM": ("vllm.models.deepseek_v4", "DeepseekV4ForCausalLM"),
++    # Vision-Exp currently declares the text architecture; launch it with
++    # --hf-overrides '{"architectures":["DeepseekV4VForConditionalGeneration"]}'.
++    "DeepseekV4VForConditionalGeneration": (
++        "vllm.models.deepseek_v4.vision_model",
++        "DeepseekV4VForConditionalGeneration",
++    ),
+     "Dots1ForCausalLM": ("dots1", "Dots1ForCausalLM"),
+     "Ernie4_5ForCausalLM": ("ernie45", "Ernie4_5ForCausalLM"),
+     "Ernie4_5_MoeForCausalLM": ("ernie45_moe", "Ernie4_5_MoeForCausalLM"),
+--- a/opt/venv/lib/python3.12/site-packages/vllm/v1/engine/input_processor.py
++++ b/opt/venv/lib/python3.12/site-packages/vllm/v1/engine/input_processor.py
+@@ -480,7 +480,14 @@
+             # Here we take the max of the two to determine if a token id is
+             # truly out-of-vocabulary.
+             model_vocab_size = model_config.get_vocab_size()
+-            if max_input_id > max(tokenizer.max_token_id, model_vocab_size - 1):
++            max_allowed_id = max(tokenizer.max_token_id, model_vocab_size - 1)
++            hf_config = model_config.hf_config
++            # Vision-Exp emits five sentinel ids [vocab_size, vocab_size + 4].
++            # They are replaced by multimodal embeddings before text lookup but
++            # remain visible to the LM for modality routing and image spans.
++            if int(getattr(hf_config, "vision_n_layers", 0) or 0) > 0:
++                max_allowed_id = max(max_allowed_id, model_vocab_size + 4)
++            if max_input_id > max_allowed_id:
+                 raise ValueError(f"Token id {max_input_id} is out of vocabulary")
+ 
+     def _validate_model_inputs(
 --- a/opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -514,7 +514,7 @@
@@ -2650,6 +2937,26 @@
          assert (
              len(
                  set(
+--- a/opt/venv/lib/python3.12/site-packages/vllm/config/speculative.py
++++ b/opt/venv/lib/python3.12/site-packages/vllm/config/speculative.py
+@@ -313,7 +313,16 @@
+             )
+         if hf_config.model_type == "deepseek_v4":
+             hf_config.model_type = "deepseek_mtp"
+-            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
++            # DS4: the DSpark drafter is ONE predictor whose three stages are
++            # the checkpoint's mtp.{0,1,2} (see amd/dspark_mtp.py); it drafts a
++            # whole block per pass, so proposer steps reuse the same predictor.
++            # num_nextn_predict_layers only differs in how checkpoints DECLARE
++            # that drafter (0731: 1, Vision-Exp: 3). n_predict=1 keeps the
++            # num_speculative_tokens validation on the MTP-5 production shape;
++            # this callable runs on a freshly loaded draft config, so a user
++            # --hf-overrides on the target cannot reach it.
++            n_predict = 1 if getattr(
++                hf_config, "num_nextn_predict_layers", None) else None
+             hf_config.update(
+                 {"n_predict": n_predict, "architectures": ["DeepSeekV4MTPModel"]}
+             )
 --- a/opt/venv/lib/python3.12/site-packages/vllm/v1/kv_offload/tiering/factory.py
 +++ b/opt/venv/lib/python3.12/site-packages/vllm/v1/kv_offload/tiering/factory.py
 @@ -69,3 +69,11 @@

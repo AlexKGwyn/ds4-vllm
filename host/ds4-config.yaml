@@ -2,7 +2,7 @@
 # Deployed as ~/ds4-config.yaml on box1 (the ray head); the cluster scripts
 # read it via `eval "$("$HOME/ds4-config")"`. Flat key: value only -- parsed
 # by ds4-config with the Python stdlib, no pyyaml.
-model: deepseek-ai/DeepSeek-V4-Flash-0731   # HF id (auto-downloaded to the HF cache) or a local path; weights needed on BOTH boxes
+model: deepseek-ai/DeepSeek-V4-Flash-0731   # HF id (auto-downloaded to the HF cache) or a local path; weights needed on BOTH boxes. For image input point this at deepseek-ai/DeepSeek-V4-Flash-Vision-Exp instead -- the launcher detects a vision checkpoint (README "Vision")
 transport: odl         # odl | tcp -- which ds4-cluster-env.<transport>.sh the cluster sources; odl is the fabric, tcp is the fallback for bring-up debugging
 head_ip: 192.168.100.1
 worker_ip: 192.168.100.2

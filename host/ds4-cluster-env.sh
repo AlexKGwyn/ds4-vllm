@@ -79,6 +79,10 @@ export DS4_MTP_CAPTURE=1
 # bounds win_kv, [n_stages, max_seqs, window, head_dim] bf16 = 3.1 MB at 8,
 # 25 MB at 64. Keep this at or above the highest concurrency you serve.
 export DS4_MTP_MAXSEQS=${DS4_MTP_MAXSEQS:-64}
+# DS4_VISION_SPAN_ATTN=1: with a Vision-Exp checkpoint, attention is bidirectional inside
+# each image span, as in the reference model; 0 keeps image spans causal.
+# No effect on the text checkpoint.
+export DS4_VISION_SPAN_ATTN=${DS4_VISION_SPAN_ATTN:-1}
 # propagate DS4_* to box2 ray workers (not in ray's default copy prefixes)
 export VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY=DS4_
 # Blocking (interrupt-based) GPU waits instead of busy-poll.

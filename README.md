@@ -39,6 +39,7 @@ order:
 ```bash
 # 0. model weights, ~150 GB, on BOTH boxes (https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
 hf download deepseek-ai/DeepSeek-V4-Flash-0731
+#    image input? download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp instead -- see "Vision" below
 
 # 1. Thunderbolt fabric, on BOTH boxes (stock kernel; ONE cable between them)
 odinlink/build-odinlink.sh && sudo odinlink/install-odinlink.sh
@@ -138,7 +139,9 @@ ds4vllm-public/
 - **Model weights**: [`deepseek-ai/DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
   (~150 GB checkpoint). Not included — `hf download deepseek-ai/DeepSeek-V4-Flash-0731`
   on both boxes (the `model:` key in `ds4-config.yaml` takes an HF id or a local
-  path). Served as `deepseek-v4-flash`.
+  path). Served as `deepseek-v4-flash`. For image input use
+  [`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp)
+  instead — see **Vision** below.
 
 ---
 
@@ -202,7 +205,7 @@ Site specifics live in **`host/ds4-config.yaml`** — deploy it (edited for your
 site) as `~/ds4-config.yaml` on box1 next to the scripts:
 
 ```yaml
-model: deepseek-ai/DeepSeek-V4-Flash-0731   # HF id or local path; weights on BOTH boxes
+model: deepseek-ai/DeepSeek-V4-Flash-0731   # HF id or local path; weights on BOTH boxes (Vision-Exp for image input, see "Vision")
 transport: odl         # odl | tcp — which ds4-cluster-env.<transport>.sh the cluster sources
 head_ip: 192.168.100.1
 worker_ip: 192.168.100.2
@@ -239,6 +242,71 @@ container heal → ray on both boxes → `vllm serve` → API/all-reduce verify)
 purpose — `examples/systemd/ds4-vllm.service` wraps the same script if you
 want a unit. The env files must stay **identical on both
 boxes** — the two TP ranks silently diverge otherwise. 
+
+---
+
+## Vision (DeepSeek-V4-Flash-Vision-Exp)
+
+The same image and scripts serve the multimodal
+[`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp)
+checkpoint — the text model plus a BF16 vision tower and aligner — taking
+images through the standard OpenAI chat `image_url` content parts. Everything
+else is as for the text checkpoint: TP=2 over the fabric, 512K context, MTP-5
+speculative decoding, fp8 KV, the disk KV tier, the `deepseek-v4-flash` served
+name. This port was built against checkpoint revision `e46e16b`.
+
+```bash
+hf download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp    # on BOTH boxes
+```
+
+Then point `model:` in `~/ds4-config.yaml` on box1 at it, and restart:
+
+```yaml
+model: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp   # or a local copy of it
+```
+
+```bash
+./ds4-serve.sh restart
+curl -s http://127.0.0.1:1234/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "deepseek-v4-flash",
+  "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "https://upload.wikimedia.org/wikipedia/commons/3/3f/JPEG_example_flower.jpg"}},
+    {"type": "text", "text": "What is in this picture?"}]}]}'
+```
+
+There is no switch to flip: the launcher reads the checkpoint's `config.json`
+and, when it declares a vision tower (`vision_n_layers`), passes
+`--hf-overrides '{"architectures":["DeepseekV4VForConditionalGeneration"],"num_nextn_predict_layers":1}'`.
+That is needed because the checkpoint's own config still declares the text
+architecture, and declares its (identical) three-stage DSpark drafter as three
+predictor layers where the text checkpoint declares one. The serve log says
+`vision checkpoint (vision_n_layers=32): serving the multimodal wrapper` when
+it took effect. To go back, point `model:` at the text checkpoint and restart.
+
+What the engine does differently for this checkpoint (rows in
+`container/patches/MANIFEST.md`):
+
+- **Image preprocessing + tower** (`mm_preprocess.py`, `vision.py`,
+  `vision_model.py`): the reference resize/grid/C4 token layout, the BF16 ViT
+  and aligner, and the five out-of-vocabulary image sentinel ids the language
+  model sees for expert routing and attention.
+- **Expert routing**: image positions use the checkpoint's visual expert
+  selection bias; text positions keep the text bias and the fused gfx1151
+  selector.
+- **Span-bidirectional attention**: inside each image span attention is
+  bidirectional, as in the reference model; text tokens take the unchanged
+  causal path. `DS4_VISION_SPAN_ATTN=0` in `ds4-cluster-env.sh` (both boxes)
+  keeps image spans causal instead. An image span cut by a chunked-prefill
+  boundary is attended causally for the cut fragment.
+- **MTP**: the DSpark drafter runs unchanged (one predictor, three internal
+  stages). Its drafts over image spans are merely lower quality — the target
+  model verifies every drafted token, so outputs are unaffected.
+
+Images cost prompt tokens (a few hundred per image at the default grid) and
+count against `max_ctx` like text. Text-only requests to the vision
+checkpoint take the same path as the text checkpoint. This profile has had
+less soak time than the text checkpoint; the text profile stays the
+reference for the performance table above.
 
 ---
 

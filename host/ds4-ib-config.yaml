@@ -1,21 +1,21 @@
-# InfiniBand-transport test profile: the serving Vision-Exp stack with the
-# TP collectives moved from OdinLink to RCCL-over-IB (ConnectX-3 mlx4 fabric).
-# Start explicitly with:
-#   DS4_CONFIG_PATH="$HOME/ds4-ib-config.yaml" "$HOME/ds4-cluster-restart.sh"
-# ds4-vision-config.yaml (transport: odl) remains the boot default/rollback.
-# Same flat key: value format as ds4-config.yaml, parsed by ds4-config.
-model: /home/alex/ds4-vision   # local Vision-Exp checkout; weights needed on BOTH boxes
-hf_overrides: {"architectures":["DeepseekV4VForConditionalGeneration"],"num_nextn_predict_layers":1}
+# InfiniBand-transport variant of ds4-config.yaml: the same cluster with the
+# TP collectives on RCCL-over-IB plus the ib_ar2 decode all-reduce (a mlx4 /
+# ConnectX-3 fabric between the boxes) instead of the OdinLink Thunderbolt
+# fabric. Deploy it AS ~/ds4-config.yaml on box1 (the scripts read only that
+# file); the keys are the same as ds4-config.yaml, only transport/rdma_hca differ.
+# Same flat key: value format, parsed by ds4-config.
+model: deepseek-ai/DeepSeek-V4-Flash-0731   # HF id or a local path; weights needed on BOTH boxes (deepseek-ai/DeepSeek-V4-Flash-Vision-Exp for image input)
 transport: ib
 head_ip: 192.168.100.1
 worker_ip: 192.168.100.2
 container: vllm
-rdma_hca: mlx4_0:1     # NCCL_IB_HCA pin: the ConnectX-3, port 1 (the cabled port)
-api_port: 1236
-disk_kv: false
+control_iface_head: thunderbolt0    # NCCL/GLOO bootstrap-socket interface per box
+control_iface_worker: thunderbolt0
+rdma_hca: mlx4_0:1     # NCCL_IB_HCA pin: HCA and port the cable is on (rdma link shows ACTIVE)
+api_port: 1234
+disk_kv: true
 disk_kv_gib: 30
 max_ctx: 524288
 kv_pin_gib: 6
 gpu_mem_util: 0.83
 warmup_ctx: 2048
-spec_tokens: 5       # MTP-5, same as production
