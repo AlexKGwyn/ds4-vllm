@@ -3,7 +3,8 @@
 A reproducible rebuild of the hand-patched vLLM engine that serves
 **DeepSeek-V4-Flash** across **two AMD Strix Halo (gfx1151) boxes**, tensor-parallel
 (TP=2), with the inter-GPU all-reduce carried over a **Thunderbolt-4 / USB4**
-link (the OdinLink driver). It contains everything needed to reconstruct the *software* from a public
+link (the OdinLink driver), or optionally over a native **InfiniBand** link
+(ConnectX-3). It contains everything needed to reconstruct the *software* from a public
 base image plus the host-side scripts that launch and drive it.
 
 This code and stack was pretty much entirely put together by AI, I probably can not help too much outside of prompting my agent.
@@ -11,22 +12,29 @@ PRs are welcome for performance improvements.
 
 ## Performance
 
-Single-stream, TP=2 across the two boxes over Thunderbolt RDMA, with the (DSpark MTP speculative decoding) enabled. Decode
+Single-stream, TP=2 across the two boxes over Thunderbolt RDMA, with DSpark
+MTP speculative decoding enabled. Decode
 speed depends on how often the drafter's parallel tokens are accepted, so
-prose and code generate at different rates. Measured on the reference rig
-(2× Ryzen AI Max+ 395 / Radeon 8060S, 128 GB UMA each): fresh uncached
-prompts, temperature 0, thinking disabled, 300-token generations.
+prose and code generate at different rates. Measured 2026-09-11 on the
+reference rig (2× Ryzen AI Max+ 395 / Radeon 8060S, 128 GB UMA each) with the
+current defaults (async scheduling, the HIP indexer scorer, disk KV on):
+fresh uncached prompts, temperature 0, thinking disabled, 300-token
+generations, decode timed from the first token.
 
 | context | prefill tok/s | decode — prose | decode — code |
 |---|---|---|---|
-| 512 | ~300 | 23 | 32 |
-| 10k | ~270 | 23 | 27 |
-| 50k | ~239 | 19 | 27 |
-| 100k | ~191 | 19 | 22 |
+| 512 | ~345 | 21 | 33 |
+| 10k | ~370 | 21 | 35 |
+| 50k | ~330 | 18 | 34 |
+| 100k | ~295 | 18 | 27 |
 
 Prefill is content-agnostic (prose and code measured within a few percent).
-A fresh bringup warms its own kernels/caches automatically
-(`warmup_ctx`), so these rates hold from the first real request.
+Decode step time is nearly flat with depth (~110 ms at 512 tokens, ~125 ms at
+100k); what moves tok/s is MTP acceptance, which is why code (~4 tokens per
+step) outruns prose (~2.3). A fresh bringup warms its own kernels/caches
+automatically (`warmup_ctx`), so these rates hold from the first real
+request. The numbers were taken on the Vision-Exp checkpoint with text-only
+requests, which take the same engine path as the text checkpoint.
 
 ---
 
@@ -46,10 +54,10 @@ odinlink/build-odinlink.sh && sudo odinlink/install-odinlink.sh
 #    migrating from the old tbv stack? sudo odinlink/uninstall-tbv.sh --apply first
 
 # 2. the patched vLLM image (box1; copy to box2 with podman save | podman load)
-container/build.sh                                  # then create the distrobox — §2 below
+container/build.sh                                  # then the ROCm 7.14 layer (§1b) and the distrobox (§2)
 
 # 3. site config + host scripts
-#    edit host/ds4-config.yaml (IPs, transport, memory) and deploy per §3
+#    edit host/ds4-config.yaml (IPs, transport odl|tcp|ib, memory) and deploy per §3
 
 # 4. launch (box1) — full 2-box bringup, OpenAI API on :1234 when done
 host/ds4-serve.sh start
@@ -89,10 +97,12 @@ for the full component/license table and upstream references.
 ds4vllm-public/
 ├── README.md                     ← this file
 ├── AGENTS.md                     ← ordered bring-up runbook (fabric → container → serve)
-├── container/                    ← rebuild the patched vLLM engine (route 2)
-│   ├── Dockerfile                ← FROM kyuz0 gfx1151 base + COPY the patch-set
+├── container/                    ← rebuild the patched vLLM engine
+│   ├── Dockerfile                ← FROM kyuz0 gfx1151 base + patch-set + in-image native builds
+│   ├── Dockerfile.rocm714        ← second layer: stable therock-7.14 ROCm/torch wheels (§1b)
 │   ├── build.sh                  ← podman build helper (runs the packaging tests first)
 │   ├── verify-patches.sh         ← prove patches/ really is base → rootfs
+│   ├── native/                   ← HIP sources built in-image: MXFP4 MoE, fp8 GEMV, indexer scorer, ib_ar2
 │   ├── rootfs/                   ← the NEW files at their real paths (modified files ship as the patch)
 │   └── patches/                  ← vllm-upstream.patch (base → patched) + MANIFEST.md
 ├── odinlink/                     ← the Thunderbolt fabric (OdinLink driver, transport: odl)
@@ -103,13 +113,17 @@ ds4vllm-public/
 │   ├── odinlink-local.patch, ar2/ ← our diff on the pin; odl_ar2 decode all-reduce
 ├── host/                         ← host-side orchestration (run outside the container)
 │   ├── ds4-config.yaml, ds4-config ← site config (IPs, transport, disk KV) + loader
+│   ├── ds4-ib-config.yaml        ← the same site config on the InfiniBand transport (example)
 │   ├── ds4-serve.sh              ← start | stop | restart | status | logs (the entry point)
 │   ├── ds4-cluster-restart.sh    ← full validated bringup (what `start` runs)
 │   ├── ds4-cluster-down.sh       ← full teardown (what `stop` runs)
 │   ├── ds4-vllm-manual-serve.sh  ← the vllm serve invocation + all serving flags
 │   ├── ds4-vllm-warmup.py        ← post-start JIT/prefill-cache warmer (warmup_ctx)
-│   ├── ds4-cluster-env*.sh       ← canonical env + DS4_* tuning knobs (odl/tcp variants)
+│   ├── ds4-cluster-env*.sh       ← canonical env + DS4_* tuning knobs (odl/tcp/ib variants)
+│   ├── ds4-rccl-bench.{sh,py}    ← RCCL all-reduce latency probe for a transport
+│   ├── bench/                    ← ib_ar2 and indexer-scorer verification probes
 │   └── container-heal.sh         ← reconcile/start a wedged podman container
+├── tests/                        ← packaging + kernel/vision unit tests (torch-dependent ones skip on a bare host)
 ├── examples/systemd/             ← OPTIONAL unit wrapping ds4-serve.sh (not installed)
 ```
 
@@ -136,6 +150,10 @@ ds4vllm-public/
   `sudo odinlink/uninstall-tbv.sh --apply` and reboot before building. It
   removes the `blacklist=thunderbolt` kernel arguments, without which no
   thunderbolt driver loads at all.
+- **Optional: an InfiniBand link.** `transport: ib` moves the TP collectives
+  onto RCCL-over-IB plus the `ib_ar2` decode all-reduce on a ConnectX-3 (mlx4)
+  fabric between the boxes. The Thunderbolt cable is still required for the
+  control plane. See **InfiniBand transport** below.
 - **Model weights**: [`deepseek-ai/DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
   (~150 GB checkpoint). Not included — `hf download deepseek-ai/DeepSeek-V4-Flash-0731`
   on both boxes (the `model:` key in `ds4-config.yaml` takes an HF id or a local
@@ -153,13 +171,16 @@ cd container
 ```
 
 This does `FROM docker.io/kyuz0/vllm-therock-gfx1151@<pinned-digest>`, applies
-`container/patches/vllm-upstream.patch` to the base's own vLLM sources (36
-files), overlays the 15 new files from `container/rootfs/`
+`container/patches/vllm-upstream.patch` to the base's own vLLM sources,
+overlays the new files from `container/rootfs/`
 (see [`container/patches/MANIFEST.md`](container/patches/MANIFEST.md)), builds
 the OdinLink userspace (the RCCL net plugin and the `odl_ar2` all-reduce, both
-fetched at a pinned revision), and rebuilds ROCr with the idle-wait fix. The
-base is ~35 GB and is pulled on first build; network is needed on the first
-build for the pinned source fetches.
+fetched at a pinned revision), compiles the four HIP libraries in
+`container/native/` (the MXFP4 MoE decode pair, the fp8 GEMV, the indexer
+scorer, and `ib_ar2`; `rootfs/` carries only their Python wrappers), installs
+`rdma-core` for the optional InfiniBand transport, and rebuilds ROCr with the
+idle-wait fix. The base is ~35 GB and is pulled on first build; network is
+needed on the first build for the pinned source fetches.
 
 **Base image drift.** The Dockerfile pins the base by **digest** so the rebuild
 matches the engine the patches were developed against (vLLM commit `470229c`). If
@@ -179,14 +200,34 @@ locally. To regenerate the patch after editing engine files, point
 `DS4_PATCH_SRC` at a tree holding the desired files and run
 `container/verify-patches.sh --write`.
 
+### 1b. The stable ROCm 7.14 layer
+
+The base ships an alpha nightly ROCm/torch/triton set. The piecewise-graph and
+decode-kernel patch set was validated on the stable therock-7.14 release
+wheels, so build a second layer on top of the image from §1 and serve from
+that one:
+
+```bash
+podman build -t ds4-vllm-rocm714:local \
+  --build-arg DS4_PREV=ds4-vllm-patched:local \
+  -f container/Dockerfile.rocm714 .
+```
+
+It swaps the venv's ROCm, torch, torchvision, torchaudio and triton wheels for
+the 7.14.0 release set from `repo.amd.com`, keeps the patched vLLM wheel
+(same torch 2.13 line), re-applies the `rootfs/` overlay, and runs an import
+smoke check. Note the stock stable ROCr replaces the idle-wait-fixed ROCr the
+first stage built. Network is needed for the wheel pulls.
+
 ## 2. Create the serving distrobox
 
 The cluster scripts `podman exec` into a container named per
 `ds4-config.yaml` (default **`vllm`**), so create one from the image you just
-built (on **both** boxes):
+built (on **both** boxes; use `ds4-vllm-patched:local` only if you skipped
+§1b):
 
 ```bash
-distrobox create --name vllm --image ds4-vllm-patched:local --additional-flags \
+distrobox create --name vllm --image ds4-vllm-rocm714:local --additional-flags \
   '--privileged --ipc host --pid host \
    --device /dev/kfd --device /dev/dri --device /dev/infiniband \
    --group-add video --group-add render --security-opt seccomp=unconfined'
@@ -206,7 +247,7 @@ site) as `~/ds4-config.yaml` on box1 next to the scripts:
 
 ```yaml
 model: deepseek-ai/DeepSeek-V4-Flash-0731   # HF id or local path; weights on BOTH boxes (Vision-Exp for image input, see "Vision")
-transport: odl         # odl | tcp — which ds4-cluster-env.<transport>.sh the cluster sources
+transport: odl         # odl | tcp | ib — which ds4-cluster-env.<transport>.sh the cluster sources
 head_ip: 192.168.100.1
 worker_ip: 192.168.100.2
 container: vllm        # podman container name (same on both boxes)
@@ -226,7 +267,10 @@ warmup_ctx: 2048       # post-start warmup prefill size; 0 disables
 the scripts. `transport: odl` is the fabric; `transport: tcp` runs the same
 cluster over plain sockets (correctness / fallback profile, with the `odl_ar2`
 decode all-reduce disabled) and is useful for isolating a bring-up problem to
-the fabric or the model path.
+the fabric or the model path. `transport: ib` runs the collectives over a
+native InfiniBand link instead of Thunderbolt; `host/ds4-ib-config.yaml` is
+that profile, with a `rdma_hca:` pin for the HCA port (deploy it *as*
+`~/ds4-config.yaml` — the scripts read only that file).
 
 Deploy (paths are `$HOME`-relative, same layout on both boxes):
 
@@ -304,9 +348,8 @@ What the engine does differently for this checkpoint (rows in
 
 Images cost prompt tokens (a few hundred per image at the default grid) and
 count against `max_ctx` like text. Text-only requests to the vision
-checkpoint take the same path as the text checkpoint. This profile has had
-less soak time than the text checkpoint; the text profile stays the
-reference for the performance table above.
+checkpoint take the same path as the text checkpoint, and the performance
+table above was measured on it.
 
 ---
 
@@ -330,7 +373,45 @@ sudo systemctl start odinlink.service # or reboot; the driver then loads at boot
 The load path signs `odl_tb5.ko` with the host's enrolled MOK when one is
 present, so it can load under Secure Boot (see **Prerequisites**). Once
 `odl-state` reports `state=ready` on both boxes, start the cluster normally.
-Details, constraints and the local patch inventory: [`odinlink/`](odinlink/).
+
+The driver is otherwise stock: the local patch on the pinned upstream is five
+bug fixes and nothing else, and the tuning/topology module parameters this
+repo used to set have been dropped. Two of the fixes matter on a
+unified-memory box that runs close to full: upstream could deliver a
+reassembly buffer with a hole in it when an atomic allocation failed (a short
+collective that looked valid, presenting as the model answering questions
+nobody asked), and the RX assembly buffers are now preallocated per stream
+(`rx_asm_max`, `rx_asm_pool`) so that allocation no longer happens in atomic
+context at all. Details, constraints and the patch inventory:
+[`odinlink/`](odinlink/).
+
+---
+
+## InfiniBand transport (optional)
+
+`transport: ib` runs the TP collectives over RCCL's built-in IB net on a
+ConnectX-3 (mlx4) fabric cabled back-to-back between the boxes, with the
+`ib_ar2` fused all-reduce carrying every decode-sized collective and RCCL
+only the prefill-sized ones. The control plane (ray, the NCCL/GLOO
+rendezvous, `thunderbolt0` with the 192.168.100.x addresses) stays on the
+Thunderbolt cable, so that link is still required; only the verbs data path
+moves. What it needs beyond the OdinLink setup:
+
+- `rdma-core` is already in the image; the distrobox command in §2 passes
+  `/dev/infiniband` through.
+- A subnet manager: the reference rig runs `opensm` in a podman container on
+  box1. `rdma link` must show the pinned port `ACTIVE` on both boxes before
+  bring-up, and `ds4-cluster-restart.sh` checks that on this transport.
+- `host/ds4-ib-config.yaml` deployed as `~/ds4-config.yaml`, with `rdma_hca:`
+  naming the HCA and cabled port (`mlx4_0:1` on the rig). The `ib` env pins
+  `NCCL_IB_GID_INDEX=0`: index 0 is the native-IB GID, and the RoCE index the
+  base env uses does not exist on an IB link.
+
+`host/ds4-rccl-bench.sh` and `host/bench/ib_ar2_test.py` are the latency
+probes for comparing a transport before serving on it. On the reference rig's
+x4-limited slots the link ceiling is ~28 Gb/s, and `ib_ar2` measures ~48 µs
+per 48 KiB decode all-reduce; `DS4_IB_AR2=0` falls back to RCCL for every
+collective.
 
 ---
 
@@ -343,31 +424,62 @@ The themes:
   attention, fp8 (UE8M0) KV-latent compress/quant, and the MTP drafter.
 - **Mid-context retrieval** — the sparse indexer runs the *official* QAT graph
   (Hadamard128 + FP4 sim) before top-512 scoring (`DS4_IDX_OFFICIAL`), which the
-  stock FP8 indexer skipped; plus a ROCm sparse-MLA attention rewrite.
+  stock FP8 indexer skipped; plus a ROCm sparse-MLA attention rewrite. At
+  decode the scorer is a hand-HIP WMMA kernel (`DS4_IDX_HIP`, default on) that
+  reads the fp8 paged cache directly — no gather, no bf16 copy, one launch per
+  request instead of one per speculative row — and is bit-exact against the
+  TileLang path it replaces. Per layer at 512K context: 1534 → 542 µs.
 - **Hand-written decode kernels** — an MXFP4 MoE decode path (gemm1 + fused
   SILU/clamp + gemm2 with fused scatter, one contiguous march per workgroup
   instead of the against-the-grain tile the stock path reads) and a dense fp8
   GEMV that replaces a bf16 path reading twice the bytes. Both are ctypes
   wrappers over libraries built in-image from `container/native/`, and both fall
   back to the stock path on any layout they do not recognise, so a missing
-  library costs speed and never correctness.
+  library costs speed and never correctness. Weight loads in both are
+  non-temporal (read-once bytes stay out of L2/MALL: the MoE pair 180 → 193 GB/s
+  against a measured 241 GB/s ceiling), and the K≤1024 GEMV scores four rows
+  per wave. The decode layer also folds its two RMSNorms into the mhc kernels'
+  output write (the kernel support existed; it was never wired), and the
+  single-kernel ragged-build path carries a `tl.assume` guard against a
+  triton 3.7 guarded-loop miscompile.
 - **Reasoning effort levels** — `low` / `high` / `max` / `none` all render.
   The encoder in the base image emitted a preamble only for `max` and silently
   ignored `high`, so a server configured for high reasoning got no preamble and
-  no error; upstream's table is backported so the setting means something.
+  no error; upstream's table is backported so the setting means something. An
+  absent `reasoning_effort` now defaults to `high`.
+- **Async scheduling** — vLLM's async scheduler was auto-disabled by the
+  unpadded drafter batches the speculative config asked for. The launcher now
+  runs padded DSpark batches with `--async-scheduling` (`DS4_ASYNC_SCHED=1`,
+  default; `0` restores the sync configuration). Two drafter changes make
+  padded batches correct: drafting at the proposer's accepted-row anchors, and
+  routing rejected rows' KV to a trash slot — both fail silently as collapsed
+  acceptance otherwise. Acceptance is unchanged and output stays deterministic.
 - **MoE / GEMM tuning** — decode-scoped MXFP4 `matmul_ogs` knobs
   (`DS4_MOE_BN/NW/NS/BK/WPE`, the `block_k` bandwidth lever), a tuned gfx1151
   A8W8 GEMM config, and a `DS4_W8A8_BF16` fast bf16 path.
-- **Thunderbolt all-reduce** — `odl_ar2` hooked into vLLM's communicator,
-  replacing RCCL for the decode TP all-reduce on the Thunderbolt link.
-- **Disk KV cache** an `fs_lru` secondary
-  tier gives the KV offloader a byte cap with LRU eviction, which the stock `fs`
-  tier has no mechanism for, so it can point at a filesystem shared with
-  everything else. Alongside it, the offloading scheduler now bounds each store
-  batch: stock asks for every un-offloaded block at once and does not advance its
-  cursor when the tier refuses, so a single refusal ratchets the ask past the
-  tier and stores stop for the rest of the request. Bounding it lets a few
-  hundred MiB of staging carry a full-length prefill.
+- **Fabric all-reduce and control plane** — `odl_ar2` hooked into vLLM's
+  communicator, replacing RCCL for the decode TP all-reduce on the Thunderbolt
+  link; `ib_ar2`, the same design ported to a mlx4 InfiniBand HCA as one fused
+  kernel per round (~48 µs for a 48 KiB all-reduce vs ~59 µs RCCL-over-IB,
+  bit-exact); and `odl_mq`, which moves the EngineCore→worker broadcast and the
+  worker response queue off zmq-over-TCP onto OdinLink streams, so decode no
+  longer inherits a TCP round-trip per step. Any init failure falls back to the
+  stock zmq path. `NCCL_PROTO` is no longer pinned to LL on either transport:
+  RCCL now only sees prefill-sized ops, where LL halves the link.
+- **Disk KV cache** — an `fs_lru` secondary tier gives the KV offloader a byte
+  cap with LRU eviction, which the stock `fs` tier has no mechanism for, so it
+  can point at a filesystem shared with everything else. It is *distributed*:
+  the scheduler only decides what to store, evict and promote, and ships the
+  byte movement to every TP rank, which reads and writes its own slice under
+  its own node-local directory. The stock scheduler-side design assumes every
+  rank shares the scheduler's staging mmap, which is false across two boxes
+  and restored silently wrong KV on the remote rank. Alongside it, the
+  offloading scheduler now bounds each store batch: stock asks for every
+  un-offloaded block at once and does not advance its cursor when the tier
+  refuses, so a single refusal ratchets the ask past the tier and stores stop
+  for the rest of the request. Bounding it lets a few hundred MiB of staging
+  carry a full-length prefill, and the staging region itself lives on the NVMe
+  as reclaimable page cache rather than in `/dev/shm`.
 
 ---
 
