@@ -11,6 +11,7 @@ control_iface_head: thunderbolt0    # NCCL/GLOO bootstrap-socket interface per b
 control_iface_worker: thunderbolt0
 odl_rank1_ip: 192.168.100.2         # odl transport only: rank-1 rendezvous address for odl_ar2 (usually = worker_ip)
 api_port: 1234
+api_host: 127.0.0.1    # OpenAI API bind address (vllm --host); the API has no auth, so 0.0.0.0 only on a trusted LAN
 disk_kv: true          # NVMe prefix-KV tier (fs_lru); prefixes survive restarts
 disk_kv_gib: 30        # per-NODE disk cap; check df on BOTH boxes before raising
 max_ctx: 524288        # --max-model-len (512K, the validated profile)
