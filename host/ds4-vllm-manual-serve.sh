@@ -197,4 +197,4 @@ exec vllm serve "$MODEL" \
   --tool-call-parser deepseek_v4 \
   "${SPEC_ARGS[@]}" \
   "${OFFLOAD[@]}" \
-  --host 127.0.0.1 --port "${DS4_API_PORT:-1234}"
+   --host "${DS4_API_HOST:-127.0.0.1}" --port "${DS4_API_PORT:-1234}"
