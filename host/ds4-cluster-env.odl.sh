@@ -5,7 +5,10 @@
 # all-reduce goes
 # through odl_ar2 and every other collective through the plugin. Bring the
 # link up first: odinlink/README.md.
-source "$HOME/ds4-cluster-env.sh"
+# Source the base env next to this file (checkout or ~/), with a ~/ fallback.
+_DS4_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ds4-cluster-env.sh"
+[ -f "$_DS4_BASE" ] || _DS4_BASE="$HOME/ds4-cluster-env.sh"
+source "$_DS4_BASE"
 export NCCL_IB_DISABLE=1
 unset  NCCL_IB_HCA NCCL_IB_GID_INDEX
 # The base env pins NCCL_PROTO=LL (right when RCCL carried the tiny decode

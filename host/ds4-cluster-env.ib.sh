@@ -8,7 +8,10 @@
 # the Thunderbolt cable is still required; only the verbs data path is IB.
 # The IB cards sit in x4-limited slots: ~27.8 Gb/s wire ceiling (ib_write_bw),
 # ~1 us raw write latency.
-source "$HOME/ds4-cluster-env.sh"
+# Source the base env next to this file (checkout or ~/), with a ~/ fallback.
+_DS4_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ds4-cluster-env.sh"
+[ -f "$_DS4_BASE" ] || _DS4_BASE="$HOME/ds4-cluster-env.sh"
+source "$_DS4_BASE"
 # Pin the exact HCA:port (rdma_hca in the site config). The base env's
 # usb4_rdma prefix would miss the mlx4 device entirely.
 export NCCL_IB_HCA=${DS4_RDMA_HCA:-mlx4_0:1}
@@ -31,7 +34,13 @@ export DS4_TBV_AR=0
 export DS4_TBV_AR2=0
 export DS4_ODL_AR2=0
 export DS4_IB_AR2=${DS4_IB_AR2:-1}
-export DS4_IB_AR2_HCA=${DS4_IB_AR2_HCA:-mlx4}
+# Device-name prefix for ibar2_init's prefix match: derive it from the site
+# HCA pin (rdma_hca) so it tracks whatever the kernel names the card --
+# mlx4_0 on stock mlx4 naming, ibp<pci>s0 on PCI-named kernels -- and fall
+# back to the mlx4 prefix when the pin is absent.
+_DS4_AR2_HCA=${DS4_RDMA_HCA%%:*}
+[ -n "$_DS4_AR2_HCA" ] || _DS4_AR2_HCA=mlx4
+export DS4_IB_AR2_HCA=${DS4_IB_AR2_HCA:-$_DS4_AR2_HCA}
 
 # Live profiling: enables /start_profile & /stop_profile API endpoints; traces
 # land in ~/vllm-profiles (shared into the container). Inert unless invoked.

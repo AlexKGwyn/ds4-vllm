@@ -38,8 +38,10 @@ PIDFILE=$RUN_DIR/serve.pid
 SERVE_LOG=$LOG_DIR/serve.log
 
 # Port comes from the site config when it is readable; the default matches
-# ds4-config.yaml's api_port.
-eval "$("$HOME/ds4-config" "$HOME/ds4-config.yaml" 2>/dev/null)" 2>/dev/null || true
+# ds4-config.yaml's api_port. Use the ~/ copy if present, else the checkout.
+CFG_LOADER=$HOME/ds4-config; [ -f "$CFG_LOADER" ] || CFG_LOADER=$HERE/ds4-config
+CFG_YAML=$HOME/ds4-config.yaml; [ -f "$CFG_YAML" ] || CFG_YAML=$HERE/ds4-config.yaml
+eval "$("$CFG_LOADER" "$CFG_YAML" 2>/dev/null)" 2>/dev/null || true
 PORT=${DS4_API_PORT:-1234}
 
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }

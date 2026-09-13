@@ -11,6 +11,10 @@ host/bench/*.jsonl
 host/bench/*_capture*.json
 host/moe_tune/runs/
 ray-tmp/
+# disk-KV tier + staging (regenerable; the default lives in $HOME, these are
+# strays when a run points DS4_DISK_KV_DIR at the checkout)
+kvcache/
+kvcache-stage/
 # kernel module build artifacts (rebuilt per kernel)
 odinlink/**/*.ko
 odinlink/**/*.o
