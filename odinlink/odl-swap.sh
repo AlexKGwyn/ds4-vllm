@@ -48,6 +48,12 @@ if [ -x "$SIGN_FILE" ] && [ -r "$MOK_PRIV" ] && [ -r "$MOK_DER" ]; then
     echo "signed odl_tb5 with enrolled host MOK: $(modinfo -F signer "$KO")"
 fi
 
+# SELinux: a freshly (re)signed .ko is labeled lib_t, and module_load is only
+# allowed on modules_object_t from the service domain. sign-file replaces the
+# inode on every run, so relabel before insmod. No-op on hosts without chcon
+# or an active policy; a genuine mislabel still fails loudly at insmod.
+chcon -t modules_object_t "$KO" 2>/dev/null || true
+
 rmmod odl_tb5 2>/dev/null && echo "removed old odl_tb5 (loopback)" || true
 rmmod thunderbolt_ibverbs 2>/dev/null && echo "removed thunderbolt_ibverbs" || true
 insmod "$KO" odl_ring_size=$RING e2e=$E2E odl_busy_poll_us=$BUSY
