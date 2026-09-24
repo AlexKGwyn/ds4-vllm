@@ -23,7 +23,11 @@
 # a '#' there silently comments out every remaining argument, and `bash -n`
 # still reports the file as valid.
 set -u
-source "$HOME/ds4-cluster-env.${DS4_TRANSPORT:-odl}.sh"
+# Source the transport env: the ~/ copy if present, else the one next to this
+# script (so the checkout works without ~/ deployment).
+ENVF=$HOME/ds4-cluster-env.${DS4_TRANSPORT:-odl}.sh
+[ -f "$ENVF" ] || ENVF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ds4-cluster-env.${DS4_TRANSPORT:-odl}.sh"
+source "$ENVF"
 
 # NVMe KV cache (fs_lru tier), ON by default. Prefix blocks evicted from GPU
 # are kept on node-local disk and reloaded instead of re-prefilled, and the
@@ -193,4 +197,4 @@ exec vllm serve "$MODEL" \
   --tool-call-parser deepseek_v4 \
   "${SPEC_ARGS[@]}" \
   "${OFFLOAD[@]}" \
-  --host 127.0.0.1 --port "${DS4_API_PORT:-1234}"
+   --host "${DS4_API_HOST:-127.0.0.1}" --port "${DS4_API_PORT:-1234}"

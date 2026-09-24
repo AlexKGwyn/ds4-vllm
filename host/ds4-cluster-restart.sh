@@ -26,9 +26,15 @@
 # ceiling, and disk-KV sizing come from ds4-config.yaml.
 set -uo pipefail
 
+# Path to this script's own dir, so the checkout works without ~/ deployment.
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
 # Site specifics (IPs, transport, container name, HCA pin) come from
-# ~/ds4-config.yaml; everything else is fixed stack layout.
-eval "$("$HOME/ds4-config" "$HOME/ds4-config.yaml")"
+# ds4-config.yaml -- the ~/ copy if present, else the checkout copy next to
+# this script. Everything else is fixed stack layout.
+CFG_LOADER=$HOME/ds4-config; [ -f "$CFG_LOADER" ] || CFG_LOADER=$HERE/ds4-config
+CFG_YAML=$HOME/ds4-config.yaml; [ -f "$CFG_YAML" ] || CFG_YAML=$HERE/ds4-config.yaml
+eval "$("$CFG_LOADER" "$CFG_YAML")"
 HEAD_IP=${DS4_HEAD_IP:?ds4-config.yaml: head_ip missing}
 WORKER_IP=${DS4_WORKER_IP:?ds4-config.yaml: worker_ip missing}
 PORT=${DS4_API_PORT:-1234}
@@ -36,8 +42,8 @@ CTR=${DS4_CONTAINER:-vllm}
 TRANSPORT=${DS4_TRANSPORT:-odl}
 RAYTMP=$HOME/ray-tmp
 RAY_NUM_CPUS=${RAY_NUM_CPUS:-4}
-CENV=$HOME/ds4-cluster-env.$TRANSPORT.sh
-SERVE=$HOME/ds4-vllm-manual-serve.sh
+CENV=$HOME/ds4-cluster-env.$TRANSPORT.sh; [ -f "$CENV" ] || CENV=$HERE/ds4-cluster-env.$TRANSPORT.sh
+SERVE=$HOME/ds4-vllm-manual-serve.sh; [ -f "$SERVE" ] || SERVE=$HERE/ds4-vllm-manual-serve.sh
 # Supervision is a pid file plus a log file -- no systemd. Wiring this to a unit
 # is left to the operator; examples/systemd/ has one that calls ds4-serve.sh.
 RUN_DIR=${DS4_RUN_DIR:-${XDG_RUNTIME_DIR:-/tmp}/ds4-vllm}
@@ -96,7 +102,8 @@ echo "   drained: box1=${u1}G box2=${u2}G swap=$(free -m | awk '/^Swap:/{print $
 
 echo "== containers =="
 # Nothing starts the containers at boot on its own, so heal both here.
-"$HOME/container-heal.sh" "$CTR" 2>&1 | sed 's/^/   /'
+HEAL=$HOME/container-heal.sh; [ -f "$HEAL" ] || HEAL=$HERE/container-heal.sh
+"$HEAL" "$CTR" 2>&1 | sed 's/^/   /'
 box2 "\$HOME/container-heal.sh $CTR" 60 2>/dev/null | sed 's/^/   /'
 inbox true 20 >/dev/null 2>&1 || { echo "!! box1 $CTR container not exec-able"; exit 1; }
 box2 "podman exec $CTR true" 20 >/dev/null 2>&1 || { echo "!! box2 $CTR container not exec-able"; exit 1; }
@@ -129,7 +136,7 @@ echo "== serve =="
 # verify block below reads it back.
 : > "$SERVE_LOG"
 setsid podman exec -u 1000:1000 -w "$HOME" "$CTR" bash -lc \
-  "$HEAD_ENVPASS export DS4_TRANSPORT=$TRANSPORT DS4_DISK_KV=$DISK_KV DS4_DISK_KV_BYTES=$DISK_KV_BYTES DS4_KV_BYTES=$KV_BYTES DS4_GPU_UTIL=$GPU_UTIL DS4_MODEL=$MODEL DS4_API_PORT=$PORT DS4_MAX_CTX=$MAX_CTX; exec bash $SERVE" \
+  "$HEAD_ENVPASS export DS4_TRANSPORT=$TRANSPORT DS4_DISK_KV=$DISK_KV DS4_DISK_KV_BYTES=$DISK_KV_BYTES DS4_KV_BYTES=$KV_BYTES DS4_GPU_UTIL=$GPU_UTIL DS4_MODEL=$MODEL DS4_API_PORT=$PORT DS4_API_HOST=${DS4_API_HOST:-127.0.0.1} DS4_MAX_CTX=$MAX_CTX; exec bash $SERVE" \
   >"$SERVE_LOG" 2>&1 </dev/null &
 echo $! > "$PIDFILE"
 
@@ -147,8 +154,9 @@ done
 # Warm the JIT kernels, the bf16 weight cache, and the prefill-indexer buckets
 # so the first real request runs at full prefill speed. Backgrounded transient
 # unit: bringup finishes now, warmup follows in ~a minute. Best-effort.
+WARMUP=$HOME/ds4-vllm-warmup.py; [ -f "$WARMUP" ] || WARMUP=$HERE/ds4-vllm-warmup.py
 DS4_VLLM_PORT=$PORT DS4_WARMUP_CTX=$WARMUP_CTX \
-  setsid python3 "$HOME/ds4-vllm-warmup.py" >"$WARMUP_LOG" 2>&1 </dev/null &
+  setsid python3 "$WARMUP" >"$WARMUP_LOG" 2>&1 </dev/null &
 echo "   warmup dispatched (ctx=$WARMUP_CTX; log: $WARMUP_LOG)"
 
 echo "== verify =="
@@ -159,8 +167,10 @@ if [ "$TRANSPORT" = ib ] || [ "$TRANSPORT" = tcp ]; then
   # ib, verify the pinned HCA is ACTIVE (opensm assigned a LID) and ib_ar2 came
   # up -- that is the link the decode all-reduce runs on.
   if [ "$TRANSPORT" = ib ]; then
-    ibl=$(rdma link 2>/dev/null | grep -w ACTIVE | grep -wF "${DS4_RDMA_HCA%%:*}" | head -1)
-    echo "   RDMA: ${ibl:-!! ${DS4_RDMA_HCA:-mlx4_0} not ACTIVE -- check cable / opensm container on box1}"
+    RDMA_HCA_NAME=${DS4_RDMA_HCA%%:*}
+    [ -n "$RDMA_HCA_NAME" ] || RDMA_HCA_NAME=mlx4_0
+    ibl=$(rdma link 2>/dev/null | grep -w ACTIVE | grep -wF "$RDMA_HCA_NAME" | head -1)
+    echo "   RDMA: ${ibl:-!! $RDMA_HCA_NAME not ACTIVE -- check cable / opensm container on box1}"
     ar=$(grep -aoE "ib_ar2: rank[0-9] ready[^\"]*" "$SERVE_LOG" 2>/dev/null | head -1)
     echo "   fast AR: ${ar:-!! ib_ar2 NOT ready -- decode all-reduce is on RCCL (DS4_IB_AR2 off or init failed)}"
   fi

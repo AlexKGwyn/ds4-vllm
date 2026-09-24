@@ -9,8 +9,11 @@
 # wrapper alone strands the server, still holding the API port.
 set -uo pipefail
 
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Teardown must work even with a broken/missing config -- fall back to defaults.
-eval "$("$HOME/ds4-config" "$HOME/ds4-config.yaml" 2>/dev/null)" 2>/dev/null || true
+CFG_LOADER=$HOME/ds4-config; [ -f "$CFG_LOADER" ] || CFG_LOADER=$HERE/ds4-config
+CFG_YAML=$HOME/ds4-config.yaml; [ -f "$CFG_YAML" ] || CFG_YAML=$HERE/ds4-config.yaml
+eval "$("$CFG_LOADER" "$CFG_YAML" 2>/dev/null)" 2>/dev/null || true
 WORKER_IP=${DS4_WORKER_IP:-192.168.100.2}
 CTR=${DS4_CONTAINER:-vllm}
 RUN_DIR=${DS4_RUN_DIR:-${XDG_RUNTIME_DIR:-/tmp}/ds4-vllm}
